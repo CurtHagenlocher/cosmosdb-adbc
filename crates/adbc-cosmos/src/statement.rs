@@ -14,7 +14,7 @@ use arrow_schema::Schema;
 use cosmos_client::CosmosClientHandle;
 use driverbase::error::ErrorHelper as _;
 
-use crate::batch_reader::SingleBatchReader;
+use crate::batch_reader::{SingleBatchReader, VecBatchReader};
 use crate::error::ErrorHelper;
 use crate::options;
 use crate::output;
@@ -73,6 +73,13 @@ impl CosmosStatement {
             query: None,
         }
     }
+}
+
+/// Map a DataFusion error into an ADBC error with a bit of context.
+fn df_error(context: &str, e: datafusion::error::DataFusionError) -> adbc_core::error::Error {
+    ErrorHelper::internal(context)
+        .message(e.to_string())
+        .to_adbc()
 }
 
 fn parse_dialect(value: &str) -> Result<Dialect> {
@@ -147,9 +154,31 @@ impl Statement for CosmosStatement {
                 };
                 Ok(Box::new(SingleBatchReader::new(batch)))
             }
-            Dialect::DataFusion => Err(ErrorHelper::not_implemented()
-                .message("datafusion dialect (Phase 2)")
-                .to_adbc()),
+            Dialect::DataFusion => {
+                let database = self.database.clone().ok_or_else(|| {
+                    ErrorHelper::invalid_state()
+                        .message("no database set (adbc.cosmos.database)")
+                        .to_adbc()
+                })?;
+                let sample = self.sample_size.unwrap_or(1000).max(1) as usize;
+                let client = self.client.clone();
+                let sql = query.to_string();
+
+                let (schema, batches) = self.runtime.block_on(async move {
+                    use datafusion::prelude::SessionContext;
+
+                    let ctx = SessionContext::new();
+                    cosmos_datafusion::register_cosmos_schema(&ctx, client, database, sample)
+                        .map_err(|e| df_error("register schema", e))?;
+                    let df = ctx.sql(&sql).await.map_err(|e| df_error("plan sql", e))?;
+                    let schema: arrow_schema::SchemaRef =
+                        std::sync::Arc::new(df.schema().as_arrow().clone());
+                    let batches = df.collect().await.map_err(|e| df_error("execute", e))?;
+                    Ok::<_, adbc_core::error::Error>((schema, batches))
+                })?;
+
+                Ok(Box::new(VecBatchReader::new(schema, batches)))
+            }
         }
     }
 

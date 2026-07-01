@@ -35,3 +35,32 @@ impl RecordBatchReader for SingleBatchReader {
         self.schema.clone()
     }
 }
+
+/// Streams a fixed list of [`RecordBatch`]es (e.g. the result of a DataFusion collect).
+pub struct VecBatchReader {
+    schema: SchemaRef,
+    batches: std::vec::IntoIter<RecordBatch>,
+}
+
+impl VecBatchReader {
+    pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        Self {
+            schema,
+            batches: batches.into_iter(),
+        }
+    }
+}
+
+impl Iterator for VecBatchReader {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.batches.next().map(Ok)
+    }
+}
+
+impl RecordBatchReader for VecBatchReader {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}

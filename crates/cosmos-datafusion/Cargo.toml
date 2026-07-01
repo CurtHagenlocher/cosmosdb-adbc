@@ -1,0 +1,22 @@
+[package]
+name = "cosmos-datafusion"
+description = "DataFusion federation for Cosmos DB: containers as tables, pushdown to the engine, local joins/aggregates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+datafusion = { version = "53", default-features = false, features = ["nested_expressions", "unicode_expressions", "regex_expressions", "sql"] }
+arrow-array = "58"
+arrow-schema = "58"
+arrow-json = "58"
+cosmos-client = { path = "../cosmos-client" }
+serde_json = { version = "1", features = ["raw_value"] }
+futures = "0.3"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

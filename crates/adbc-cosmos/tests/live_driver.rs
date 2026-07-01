@@ -107,6 +107,48 @@ fn native_struct_query_infers_schema() {
     assert_eq!(rows, 50);
 }
 
+#[test]
+#[ignore = "requires the local Cosmos emulator (run cosmos-client's seed example first)"]
+fn datafusion_dialect_joins_across_containers() {
+    let mut driver = CosmosDriver::default();
+    let db = driver
+        .new_database_with_opts([
+            (
+                OptionDatabase::Uri,
+                OptionValue::String("https://localhost:8081/".into()),
+            ),
+            other("adbc.cosmos.auth", "key"),
+            other("adbc.cosmos.account_key", EMULATOR_KEY),
+            other("adbc.cosmos.database", "spikedb"),
+        ])
+        .expect("new_database");
+    let mut conn = db.new_connection().expect("new_connection");
+    let mut stmt = conn.new_statement().expect("new_statement");
+
+    stmt.set_option(
+        OptionStatement::Other("adbc.cosmos.dialect".into()),
+        OptionValue::String("datafusion".into()),
+    )
+    .expect("set dialect=datafusion");
+
+    // A cross-container JOIN — Cosmos cannot do this natively; DataFusion joins the two
+    // container scans locally. Each of the 50 items matches exactly one category on pk.
+    stmt.set_sql_query(
+        "SELECT i.name AS item_name, c.label AS category \
+         FROM items i JOIN categories c ON i.pk = c.pk",
+    )
+    .expect("set query");
+
+    let reader = stmt.execute().expect("execute");
+    let schema = reader.schema();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert!(names.contains(&"item_name"), "missing item_name (got {names:?})");
+    assert!(names.contains(&"category"), "missing category (got {names:?})");
+
+    let rows: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
+    assert_eq!(rows, 50, "each item should join exactly one category");
+}
+
 #[cfg(feature = "variant")]
 #[test]
 #[ignore = "requires the local Cosmos emulator + --features variant (run seed first)"]

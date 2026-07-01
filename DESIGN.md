@@ -317,8 +317,21 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
   (`parquet_variant_compute::json_to_variant` → `arrow.parquet.variant`, behind the opt-in `variant`
   feature; returns "not implemented" when the feature is off). `tests/live_driver.rs` exercises all
   three against the emulator (JSON single column; struct with inferred `id`/`pk`/`mergeOrder`/`nested`/
-  `tags` columns; Variant struct column). Clippy-clean in both feature sets. The DataFusion dialect
-  still returns "not implemented" (Phase 2).
+  `tags` columns; Variant struct column). Clippy-clean in both feature sets.
+- **Phase 2 — DataFusion federation, first cut DONE, live-verified.** New crate `cosmos-datafusion`:
+  `CosmosSchemaProvider` (lazy — resolves each referenced container by name, inferring its schema by
+  sampling on first use), `CosmosTableProvider` (schema + `scan` with **projection + limit pushdown**
+  into `SELECT c["f"] AS f … FROM c OFFSET 0 LIMIT n`), and `CosmosExec` (`ExecutionPlan` deferring
+  I/O to stream-poll time; runs the Cosmos SQL through the engine and decodes docs into the scan
+  schema). `register_cosmos_schema` installs it as `datafusion.public`. In `adbc-cosmos`, the
+  `datafusion` dialect builds a `SessionContext`, registers the current database, runs `ctx.sql` and
+  collects. Verified against the emulator: `SELECT … FROM items i JOIN categories c ON i.pk = c.pk`
+  returns 50 joined rows — a query Cosmos cannot do natively, performed by DataFusion over two
+  engine-backed container scans.
+  - **First-cut scope / next:** filters are **not** pushed yet (`supports_filters_pushdown` left at
+    default Unsupported → DataFusion applies them locally, correct but less efficient). Follow-ups:
+    filter pushdown into Cosmos `WHERE` (the capability model), schema caching per container, and
+    bracket-quoting/escaping of arbitrary field names in generated Cosmos SQL.
 
 
 - **Phase 0 — done.** `crates/adbc-cosmos`: four `adbc_core` traits on real types, `adbc.cosmos.*`

@@ -67,6 +67,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!("seeded {count} documents into '{database}/{container}'");
+
+    // A second container to demonstrate cross-container joins in the datafusion dialect:
+    // one category row per partition-key value, joinable to `items` on `pk`.
+    let categories = "categories";
+    let cat_props = ContainerProperties {
+        id: categories.into(),
+        partition_key: "/pk".into(),
+        ..Default::default()
+    };
+    match db.create_container(cat_props, None).await {
+        Ok(_) => println!("created container '{categories}' (partition key /pk)"),
+        Err(e) => println!("create_container: {e} (continuing — it may already exist)"),
+    }
+    let cat_client = db.container_client(categories);
+    for p in 0..5 {
+        let pk = format!("pk-{p}");
+        let doc = json!({ "id": pk, "pk": pk, "label": format!("Category {p}") });
+        cat_client.upsert_item(pk.clone(), &doc, None).await?;
+    }
+    println!("seeded 5 documents into '{database}/{categories}'");
+
     println!("next: cargo run -p cosmos-client --example spike_a");
     Ok(())
 }
