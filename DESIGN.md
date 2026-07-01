@@ -294,3 +294,19 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
   `InfoBuilder`/`InfoRegistry` in lib.rs; git-only, no crates.io release.
 - **Corrections vs initial research:** `azure_data_cosmos` IS published (pin `=0.29.0` for the seam);
   `azure_data_cosmos_engine` is NOT published (git dep); adbc main is 0.24 (we target 0.23).
+- **Auth (verified while building Spike A):** `azure_identity` 0.30 has **no** all-in-one
+  `DefaultAzureCredential`. The Entra path uses `DeveloperToolsCredential::new(None)` (az/azd
+  developer sign-in); production managed-identity/service-principal will select explicitly among
+  `ManagedIdentityCredential` / `ClientSecretCredential` / `WorkloadIdentityCredential` in Phase 1.
+  Account-key auth is `CosmosClient::with_key(endpoint, Secret, None)` (feature `key_auth`);
+  connection-string is `CosmosClient::with_connection_string(Secret, None)`.
+
+## 8. Build status
+
+- **Phase 0 — done.** `crates/adbc-cosmos`: four `adbc_core` traits on real types, `adbc.cosmos.*`
+  option parsing, working `get_info`, `export_driver!` (both `AdbcDriverCosmosDbInit` and the
+  fallback `AdbcDriverInit` exported in the built `cdylib`). In-process smoke tests pass.
+- **Spike A — build-proven.** `crates/cosmos-client`: neutral transport (Entra/key/connection-string
+  auth; engine-driven cross-partition query → raw JSON). The full Azure + engine dependency stack
+  resolves and compiles in-workspace. `examples/spike_a.rs` drives it from env vars; a **live run**
+  against a real account or the Cosmos emulator is the outstanding step.
