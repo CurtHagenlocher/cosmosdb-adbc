@@ -10,11 +10,14 @@
 //! the `cosmos-client` transport crate in Phase 1.
 
 mod batch_reader;
+mod client;
 mod connection;
 mod database;
 mod driver;
 mod error;
 mod options;
+mod output;
+mod runtime;
 mod statement;
 
 pub use driver::CosmosDriver;

@@ -303,6 +303,16 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
 
 ## 8. Build status
 
+- **Phase 1 — native dialect DONE, live-verified.** `adbc-cosmos` now executes queries: a shared
+  multi-thread Tokio runtime per database (`runtime.rs`) bridges the async transport to the sync
+  ADBC boundary; `client.rs` builds a `cosmos-client` handle from options (connstring > key > Entra);
+  `Statement::execute` (native dialect) runs the Cosmos SQL through the engine and returns the
+  default JSON output — a single `document` column, `Utf8`/`arrow.json`, full-fidelity raw JSON per
+  the user's choice (`output.rs`). Verified against the emulator via `tests/live_driver.rs`
+  (`#[ignore]`): a cross-partition `ORDER BY` returns a 50-row `arrow.json` batch through the driver's
+  public ADBC API. Variant/struct output and the DataFusion dialect return "not implemented" for now.
+
+
 - **Phase 0 — done.** `crates/adbc-cosmos`: four `adbc_core` traits on real types, `adbc.cosmos.*`
   option parsing, working `get_info`, `export_driver!` (both `AdbcDriverCosmosDbInit` and the
   fallback `AdbcDriverInit` exported in the built `cdylib`). In-process smoke tests pass.

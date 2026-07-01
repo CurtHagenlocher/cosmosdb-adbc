@@ -7,9 +7,11 @@ use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
 use adbc_core::{Database, Optionable};
 use driverbase::error::ErrorHelper as _;
 
+use crate::client::build_client;
 use crate::connection::CosmosConnection;
 use crate::error::ErrorHelper;
 use crate::options;
+use crate::runtime::Runtime;
 
 /// Connection configuration parsed from database-level options, shared (read-only)
 /// with every connection and statement created beneath this database.
@@ -27,9 +29,18 @@ pub struct DatabaseConfig {
     pub database: Option<String>,
 }
 
-#[derive(Default)]
 pub struct CosmosDatabase {
     config: DatabaseConfig,
+    runtime: Arc<Runtime>,
+}
+
+impl CosmosDatabase {
+    pub(crate) fn new(runtime: Arc<Runtime>) -> Self {
+        Self {
+            config: DatabaseConfig::default(),
+            runtime,
+        }
+    }
 }
 
 impl Database for CosmosDatabase {
@@ -43,7 +54,14 @@ impl Database for CosmosDatabase {
         &self,
         opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
     ) -> Result<Self::ConnectionType> {
-        let mut connection = CosmosConnection::new(Arc::new(self.config.clone()));
+        // Constructing the client is cheap and offline; the first network call happens on
+        // query execution.
+        let client = Arc::new(build_client(&self.config)?);
+        let mut connection = CosmosConnection::new(
+            Arc::new(self.config.clone()),
+            self.runtime.clone(),
+            client,
+        );
         for (key, value) in opts {
             connection.set_option(key, value)?;
         }

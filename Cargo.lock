@@ -10,7 +10,10 @@ dependencies = [
  "adbc_ffi",
  "arrow-array",
  "arrow-schema",
+ "cosmos-client",
  "driverbase",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -13,6 +13,9 @@ adbc_ffi = { workspace = true, optional = true }
 arrow-array.workspace = true
 arrow-schema.workspace = true
 driverbase.workspace = true
+cosmos-client = { path = "../cosmos-client" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [features]
 default = ["ffi"]

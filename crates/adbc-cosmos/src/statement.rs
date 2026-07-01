@@ -11,11 +11,14 @@ use adbc_core::options::{OptionStatement, OptionValue};
 use adbc_core::{Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
+use cosmos_client::CosmosClientHandle;
 use driverbase::error::ErrorHelper as _;
 
-use crate::database::DatabaseConfig;
+use crate::batch_reader::SingleBatchReader;
 use crate::error::ErrorHelper;
 use crate::options;
+use crate::output;
+use crate::runtime::Runtime;
 
 /// Which SQL dialect `set_sql_query` accepts and how the query is executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,7 +46,8 @@ pub enum OutputMode {
 /// in Phase 1; they are parsed and validated now so the option surface is testable.
 #[allow(dead_code)]
 pub struct CosmosStatement {
-    config: Arc<DatabaseConfig>,
+    runtime: Arc<Runtime>,
+    client: Arc<CosmosClientHandle>,
     database: Option<String>,
     container: Option<String>,
     dialect: Dialect,
@@ -53,9 +57,14 @@ pub struct CosmosStatement {
 }
 
 impl CosmosStatement {
-    pub(crate) fn new(config: Arc<DatabaseConfig>, database: Option<String>) -> Self {
+    pub(crate) fn new(
+        runtime: Arc<Runtime>,
+        client: Arc<CosmosClientHandle>,
+        database: Option<String>,
+    ) -> Self {
         Self {
-            config,
+            runtime,
+            client,
             database,
             container: None,
             dialect: Dialect::default(),
@@ -103,9 +112,49 @@ impl Statement for CosmosStatement {
     }
 
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send>> {
-        Err(ErrorHelper::not_implemented()
-            .message("execute (query execution arrives in Phase 1)")
-            .to_adbc())
+        let query = self.query.as_deref().ok_or_else(|| {
+            ErrorHelper::invalid_state()
+                .message("no query has been set")
+                .to_adbc()
+        })?;
+
+        match self.dialect {
+            Dialect::Native => {
+                let database = self.database.as_deref().ok_or_else(|| {
+                    ErrorHelper::invalid_state()
+                        .message("no database set (adbc.cosmos.database)")
+                        .to_adbc()
+                })?;
+                let container = self.container.as_deref().ok_or_else(|| {
+                    ErrorHelper::invalid_state()
+                        .message("native dialect requires a container (adbc.cosmos.container)")
+                        .to_adbc()
+                })?;
+
+                let docs = self
+                    .runtime
+                    .block_on(self.client.query_documents(database, container, query))
+                    .map_err(|e| ErrorHelper::internal("query").message(e.to_string()).to_adbc())?;
+
+                let batch = match self.output {
+                    OutputMode::Json => output::build_json_batch(&docs)?,
+                    OutputMode::Variant => {
+                        return Err(ErrorHelper::not_implemented()
+                            .message("variant output mode (later phase)")
+                            .to_adbc());
+                    }
+                    OutputMode::Struct => {
+                        return Err(ErrorHelper::not_implemented()
+                            .message("struct output mode (later phase)")
+                            .to_adbc());
+                    }
+                };
+                Ok(Box::new(SingleBatchReader::new(batch)))
+            }
+            Dialect::DataFusion => Err(ErrorHelper::not_implemented()
+                .message("datafusion dialect (Phase 2)")
+                .to_adbc()),
+        }
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {

@@ -11,24 +11,35 @@ use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::{Connection, Optionable};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema;
+use cosmos_client::CosmosClientHandle;
 use driverbase::error::ErrorHelper as _;
 
 use crate::database::DatabaseConfig;
 use crate::error::ErrorHelper;
 use crate::options;
+use crate::runtime::Runtime;
 use crate::statement::CosmosStatement;
 
 pub struct CosmosConnection {
+    #[allow(dead_code)]
     config: Arc<DatabaseConfig>,
+    runtime: Arc<Runtime>,
+    client: Arc<CosmosClientHandle>,
     /// The database (ADBC catalog) this connection is scoped to.
     current_database: Option<String>,
 }
 
 impl CosmosConnection {
-    pub(crate) fn new(config: Arc<DatabaseConfig>) -> Self {
+    pub(crate) fn new(
+        config: Arc<DatabaseConfig>,
+        runtime: Arc<Runtime>,
+        client: Arc<CosmosClientHandle>,
+    ) -> Self {
         let current_database = config.database.clone();
         Self {
             config,
+            runtime,
+            client,
             current_database,
         }
     }
@@ -39,7 +50,8 @@ impl Connection for CosmosConnection {
 
     fn new_statement(&mut self) -> Result<Self::StatementType> {
         Ok(CosmosStatement::new(
-            self.config.clone(),
+            self.runtime.clone(),
+            self.client.clone(),
             self.current_database.clone(),
         ))
     }
