@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use cosmos_client::CosmosClientHandle;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::logical_expr::TableType;
+use datafusion::logical_expr::{TableProviderFilterPushDown, TableType};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -19,7 +19,7 @@ use datafusion::physical_plan::{
 use datafusion::prelude::Expr;
 use futures::TryStreamExt;
 
-use crate::convert;
+use crate::{convert, predicate};
 
 /// A single Cosmos container exposed as a DataFusion table with an inferred schema.
 pub struct CosmosTableProvider {
@@ -68,14 +68,34 @@ impl TableProvider for CosmosTableProvider {
         TableType::Base
     }
 
+    /// Report which filters Cosmos can evaluate exactly. DataFusion only passes the ones we
+    /// mark `Exact` to [`scan`](Self::scan); the rest it applies locally. See
+    /// [`crate::predicate`] for the (deliberately small, provably row-equivalent) set.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(predicate::pushdown_decisions(filters))
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let (projected_schema, sql) = convert::build_scan_sql(&self.schema, projection, limit);
+        // DataFusion passes only filters we marked `Exact`; translate each and AND them
+        // into a single WHERE clause. `translate` mirrors the pushdown decision, so every
+        // filter here is expected to translate.
+        let clauses: Vec<String> = filters.iter().filter_map(predicate::translate).collect();
+        let where_clause = if clauses.is_empty() {
+            None
+        } else {
+            Some(clauses.join(" AND "))
+        };
+        let (projected_schema, sql) =
+            convert::build_scan_sql(&self.schema, projection, where_clause.as_deref(), limit);
         Ok(Arc::new(CosmosExec::new(
             self.client.clone(),
             self.database.clone(),

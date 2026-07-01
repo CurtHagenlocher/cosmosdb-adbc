@@ -328,10 +328,23 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
   collects. Verified against the emulator: `SELECT … FROM items i JOIN categories c ON i.pk = c.pk`
   returns 50 joined rows — a query Cosmos cannot do natively, performed by DataFusion over two
   engine-backed container scans.
-  - **First-cut scope / next:** filters are **not** pushed yet (`supports_filters_pushdown` left at
-    default Unsupported → DataFusion applies them locally, correct but less efficient). Follow-ups:
-    filter pushdown into Cosmos `WHERE` (the capability model), schema caching per container, and
-    bracket-quoting/escaping of arbitrary field names in generated Cosmos SQL.
+  - **Filter pushdown DONE, live-verified.** New `predicate.rs`: `supports_filters_pushdown`
+    returns `Exact` only for a small, provably row-equivalent set — column-vs-literal comparisons
+    (`= != < <= > >=`), `IN`/`NOT IN`, `IS NULL`/`IS NOT NULL`, and `AND`/`OR` of those; everything
+    else → `Unsupported` (DataFusion keeps it). Accepted filters translate to a Cosmos `WHERE`
+    clause appended by `build_scan_sql` before `OFFSET…LIMIT`. **Null/undefined/3VL trap:** each
+    column comparison / `IN` leaf is wrapped `IS_DEFINED(c["x"]) AND NOT IS_NULL(c["x"]) AND (…)`
+    so it is two-valued and matches DataFusion's "a null excludes the row" semantics exactly
+    (a raw `c["x"] != 5` / `NOT IN` is *true* for a JSON `null`, which would corrupt results).
+    `IS NULL` → `(NOT IS_DEFINED(x) OR IS_NULL(x))`; `IS NOT NULL` → the guard itself. Field-name
+    bracket-quoting/escaping now shared via `predicate::cosmos_property` (escapes `\` then `"`).
+    Connectionless unit tests assert both the generated SQL and the Exact/Unsupported decisions;
+    a live `#[ignore]` test (`WHERE "mergeOrder" > 25` → exactly the 25-row subset) confirms the
+    clause reaches Cosmos (DataFusion drops the `Exact` filter, so a wrong translation would return
+    all 50).
+  - **First-cut scope / next:** capability-gated *subtree* folding (multi-op round-trips like
+    filter+aggregate in one query) is still future work; per-scan projection/limit/filter pushdown
+    covers the common case. Also open: schema caching per container.
 
 
 - **Phase 0 — done.** `crates/adbc-cosmos`: four `adbc_core` traits on real types, `adbc.cosmos.*`

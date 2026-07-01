@@ -25,12 +25,14 @@ pub(crate) fn decode_docs(schema: SchemaRef, docs: &[Value]) -> Result<Vec<Recor
 
 /// Build the projected output schema and the Cosmos SQL for a scan.
 ///
-/// Projection is pushed into the SELECT list (`SELECT c["f"] AS f, … FROM c`) and any
-/// limit becomes `OFFSET 0 LIMIT n`. Filters are not pushed yet — DataFusion applies them
-/// locally — so results stay correct while federation (joins/aggregates) is proven out.
+/// Projection is pushed into the SELECT list (`SELECT c["f"] AS f, … FROM c`), pushable
+/// filters become a `WHERE` clause (see [`crate::predicate`]), and any limit becomes
+/// `OFFSET 0 LIMIT n`. Filters DataFusion did *not* mark pushable never reach here — it
+/// applies those locally.
 pub(crate) fn build_scan_sql(
     full_schema: &SchemaRef,
     projection: Option<&Vec<usize>>,
+    where_clause: Option<&str>,
     limit: Option<usize>,
 ) -> (SchemaRef, String) {
     let (schema, select) = match projection {
@@ -40,7 +42,7 @@ pub(crate) fn build_scan_sql(
                 .iter()
                 .map(|f| {
                     let name = f.name();
-                    format!("c[\"{}\"] AS {}", name.replace('"', "\\\""), name)
+                    format!("{} AS {}", crate::predicate::cosmos_property(name), name)
                 })
                 .collect();
             (Arc::new(Schema::new(fields)), cols.join(", "))
@@ -49,8 +51,55 @@ pub(crate) fn build_scan_sql(
     };
 
     let mut sql = format!("SELECT {select} FROM c");
+    if let Some(clause) = where_clause {
+        sql.push_str(&format!(" WHERE {clause}"));
+    }
     if let Some(n) = limit {
         sql.push_str(&format!(" OFFSET 0 LIMIT {n}"));
     }
     (schema, sql)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::DataType;
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("mergeOrder", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    #[test]
+    fn projection_where_and_limit_compose() {
+        let s = schema();
+        let (proj_schema, sql) = build_scan_sql(
+            &s,
+            Some(&vec![0, 1]),
+            Some(r#"(IS_DEFINED(c["mergeOrder"]) AND NOT IS_NULL(c["mergeOrder"]) AND (c["mergeOrder"] > 25))"#),
+            Some(10),
+        );
+        assert_eq!(
+            sql,
+            r#"SELECT c["id"] AS id, c["mergeOrder"] AS mergeOrder FROM c WHERE (IS_DEFINED(c["mergeOrder"]) AND NOT IS_NULL(c["mergeOrder"]) AND (c["mergeOrder"] > 25)) OFFSET 0 LIMIT 10"#
+        );
+        // The projected schema carries only the selected columns, in order.
+        let names: Vec<&str> = proj_schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["id", "mergeOrder"]);
+    }
+
+    #[test]
+    fn no_projection_no_filter_is_select_star() {
+        let (_, sql) = build_scan_sql(&schema(), None, None, None);
+        assert_eq!(sql, "SELECT * FROM c");
+    }
+
+    #[test]
+    fn where_clause_precedes_offset_limit() {
+        let (_, sql) = build_scan_sql(&schema(), None, Some("(c[\"a\"] = 1)"), Some(5));
+        assert_eq!(sql, "SELECT * FROM c WHERE (c[\"a\"] = 1) OFFSET 0 LIMIT 5");
+    }
 }

@@ -149,6 +149,62 @@ fn datafusion_dialect_joins_across_containers() {
     assert_eq!(rows, 50, "each item should join exactly one category");
 }
 
+#[test]
+#[ignore = "requires the local Cosmos emulator (run cosmos-client's seed example first)"]
+fn datafusion_dialect_pushes_filter_into_cosmos() {
+    let mut driver = CosmosDriver::default();
+    let db = driver
+        .new_database_with_opts([
+            (
+                OptionDatabase::Uri,
+                OptionValue::String("https://localhost:8081/".into()),
+            ),
+            other("adbc.cosmos.auth", "key"),
+            other("adbc.cosmos.account_key", EMULATOR_KEY),
+            other("adbc.cosmos.database", "spikedb"),
+        ])
+        .expect("new_database");
+    let mut conn = db.new_connection().expect("new_connection");
+    let mut stmt = conn.new_statement().expect("new_statement");
+
+    stmt.set_option(
+        OptionStatement::Other("adbc.cosmos.dialect".into()),
+        OptionValue::String("datafusion".into()),
+    )
+    .expect("set dialect=datafusion");
+
+    // `mergeOrder = 50 - i` for i in 0..50, so mergeOrder ranges 1..=50. The predicate
+    // `mergeOrder > 25` selects mergeOrder 26..=50 — exactly 25 rows. This WHERE is pushed
+    // into the generated Cosmos SQL (supports_filters_pushdown → Exact); DataFusion keeps
+    // no residual filter.
+    // `mergeOrder` is camelCase, so it must be double-quoted or DataFusion lowercases it.
+    stmt.set_sql_query(r#"SELECT id, "mergeOrder" FROM items WHERE "mergeOrder" > 25"#)
+        .expect("set query");
+
+    let reader = stmt.execute().expect("execute");
+    let schema = reader.schema();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert!(names.contains(&"mergeOrder"), "missing mergeOrder (got {names:?})");
+
+    let batches: Vec<_> = reader.map(|b| b.expect("batch")).collect();
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 25, "expected the mergeOrder > 25 subset");
+
+    // Every returned row must actually satisfy the predicate (guards against a dropped
+    // filter silently returning the whole container).
+    for batch in &batches {
+        let idx = batch.schema().index_of("mergeOrder").expect("mergeOrder column");
+        let col = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("mergeOrder is Int64");
+        for r in 0..col.len() {
+            assert!(col.value(r) > 25, "row leaked past the pushed filter: {}", col.value(r));
+        }
+    }
+}
+
 #[cfg(feature = "variant")]
 #[test]
 #[ignore = "requires the local Cosmos emulator + --features variant (run seed first)"]

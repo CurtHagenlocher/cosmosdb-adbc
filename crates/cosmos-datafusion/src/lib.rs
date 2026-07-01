@@ -1,14 +1,15 @@
 //! DataFusion federation for Cosmos DB.
 //!
 //! Registers Cosmos containers as DataFusion tables so ANSI SQL can be run over them:
-//! projection (and, later, filters) that Cosmos can do are pushed into engine-executed
-//! Cosmos SQL, and DataFusion performs joins / cross-container aggregates / anything
-//! unpushable locally.
+//! projection and the filters Cosmos can evaluate are pushed into engine-executed Cosmos
+//! SQL, and DataFusion performs joins / cross-container aggregates / anything unpushable
+//! locally.
 //!
 //! Usage: build a `SessionContext`, call [`register_cosmos_schema`], then `ctx.sql(...)`.
 
 mod catalog;
 mod convert;
+mod predicate;
 mod provider;
 
 use std::sync::Arc;
