@@ -306,7 +306,13 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
 - **Phase 0 — done.** `crates/adbc-cosmos`: four `adbc_core` traits on real types, `adbc.cosmos.*`
   option parsing, working `get_info`, `export_driver!` (both `AdbcDriverCosmosDbInit` and the
   fallback `AdbcDriverInit` exported in the built `cdylib`). In-process smoke tests pass.
-- **Spike A — build-proven.** `crates/cosmos-client`: neutral transport (Entra/key/connection-string
-  auth; engine-driven cross-partition query → raw JSON). The full Azure + engine dependency stack
-  resolves and compiles in-workspace. `examples/spike_a.rs` drives it from env vars; a **live run**
-  against a real account or the Cosmos emulator is the outstanding step.
+- **Spike A — DONE, live-verified.** `crates/cosmos-client`: neutral transport (Entra/key/
+  connection-string auth; engine-driven cross-partition query → raw JSON). Verified against the local
+  Cosmos emulator: `SELECT * FROM c ORDER BY c.mergeOrder` returned 50 docs **globally ordered across
+  5 partition keys** — consecutive sorted rows come from different partitions, proving the engine's
+  client-side cross-partition merge ran (the exact query the public SDK alone rejects). Repeatable via
+  the `#[ignore]`d `tests/live_emulator.rs` (run `examples/seed` first). `examples/{seed,spike_a}`
+  are zero-config against the emulator.
+  - **Observation for the output builders:** raw documents include Cosmos system fields
+    (`_rid`, `_self`, `_etag`, `_attachments`, `_ts`). Offer an option to strip these (analogous to
+    the ODBC driver's hidden columns); keep `id` and the partition-key field.
