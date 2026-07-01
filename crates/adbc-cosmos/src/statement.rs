@@ -138,16 +138,12 @@ impl Statement for CosmosStatement {
 
                 let batch = match self.output {
                     OutputMode::Json => output::build_json_batch(&docs)?,
-                    OutputMode::Variant => {
-                        return Err(ErrorHelper::not_implemented()
-                            .message("variant output mode (later phase)")
-                            .to_adbc());
-                    }
                     OutputMode::Struct => {
-                        return Err(ErrorHelper::not_implemented()
-                            .message("struct output mode (later phase)")
-                            .to_adbc());
+                        // Default sample size mirrors a "read the first page" heuristic.
+                        let sample = self.sample_size.unwrap_or(1000).max(1) as usize;
+                        output::build_struct_batch(&docs, sample)?
                     }
+                    OutputMode::Variant => output::build_variant_batch(&docs)?,
                 };
                 Ok(Box::new(SingleBatchReader::new(batch)))
             }

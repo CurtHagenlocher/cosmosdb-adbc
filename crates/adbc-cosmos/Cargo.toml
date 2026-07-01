@@ -12,15 +12,20 @@ adbc_core.workspace = true
 adbc_ffi = { workspace = true, optional = true }
 arrow-array.workspace = true
 arrow-schema.workspace = true
+arrow-json = "58"
 driverbase.workspace = true
 cosmos-client = { path = "../cosmos-client" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
+# Experimental Arrow Variant support (opt-in): parquet-variant-compute is feature-gated.
+parquet-variant-compute = { version = "58", optional = true }
 
 [features]
 default = ["ffi"]
 # Exports the C ABI entry point (AdbcDriverCosmosDbInit) for loading via a driver manager.
 ffi = ["dep:adbc_ffi"]
+# Opt-in Arrow Variant output (experimental parquet-variant-compute).
+variant = ["dep:parquet-variant-compute"]
 
 [lib]
 crate-type = ["lib", "cdylib"]

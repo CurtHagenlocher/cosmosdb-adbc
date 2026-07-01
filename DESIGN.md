@@ -310,7 +310,15 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
   default JSON output — a single `document` column, `Utf8`/`arrow.json`, full-fidelity raw JSON per
   the user's choice (`output.rs`). Verified against the emulator via `tests/live_driver.rs`
   (`#[ignore]`): a cross-partition `ORDER BY` returns a 50-row `arrow.json` batch through the driver's
-  public ADBC API. Variant/struct output and the DataFusion dialect return "not implemented" for now.
+  public ADBC API.
+- **Output modes — all three DONE, live-verified.** `output.rs`: `build_json_batch` (default,
+  `arrow.json`), `build_struct_batch` (sample N docs → `infer_json_schema_from_iterator` → `Decoder`
+  project; sample size via `adbc.cosmos.sample_size`, default 1000), and `build_variant_batch`
+  (`parquet_variant_compute::json_to_variant` → `arrow.parquet.variant`, behind the opt-in `variant`
+  feature; returns "not implemented" when the feature is off). `tests/live_driver.rs` exercises all
+  three against the emulator (JSON single column; struct with inferred `id`/`pk`/`mergeOrder`/`nested`/
+  `tags` columns; Variant struct column). Clippy-clean in both feature sets. The DataFusion dialect
+  still returns "not implemented" (Phase 2).
 
 
 - **Phase 0 — done.** `crates/adbc-cosmos`: four `adbc_core` traits on real types, `adbc.cosmos.*`
