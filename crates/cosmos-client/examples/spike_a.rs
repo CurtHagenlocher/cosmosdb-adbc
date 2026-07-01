@@ -17,16 +17,26 @@ use std::error::Error;
 
 use cosmos_client::{CosmosClientHandle, Credential};
 
+/// Public, well-known key for the local Cosmos DB emulator (not a secret).
+const EMULATOR_KEY: &str =
+    "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw==";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let endpoint = std::env::var("COSMOS_ENDPOINT")?;
-    let auth = std::env::var("COSMOS_AUTH").unwrap_or_else(|_| "entra".to_string());
-    let database = std::env::var("COSMOS_DATABASE")?;
-    let container = std::env::var("COSMOS_CONTAINER")?;
-    let query = std::env::var("COSMOS_QUERY").unwrap_or_else(|_| "SELECT * FROM c".to_string());
+    // Defaults target the local emulator + the data written by `seed`, so this runs with
+    // zero configuration. Override any of these via env for a real account.
+    let endpoint =
+        std::env::var("COSMOS_ENDPOINT").unwrap_or_else(|_| "https://localhost:8081/".to_string());
+    let auth = std::env::var("COSMOS_AUTH").unwrap_or_else(|_| "key".to_string());
+    let database = std::env::var("COSMOS_DATABASE").unwrap_or_else(|_| "spikedb".to_string());
+    let container = std::env::var("COSMOS_CONTAINER").unwrap_or_else(|_| "items".to_string());
+    let query = std::env::var("COSMOS_QUERY")
+        .unwrap_or_else(|_| "SELECT * FROM c ORDER BY c.mergeOrder".to_string());
 
     let credential = match auth.as_str() {
-        "key" => Credential::Key(std::env::var("COSMOS_KEY")?),
+        "key" => Credential::Key(
+            std::env::var("COSMOS_KEY").unwrap_or_else(|_| EMULATOR_KEY.to_string()),
+        ),
         "connection_string" => {
             Credential::ConnectionString(std::env::var("COSMOS_CONNECTION_STRING")?)
         }
