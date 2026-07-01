@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/adbc-cosmos"]
+members = ["crates/adbc-cosmos", "crates/cosmos-client"]
 
 [workspace.package]
 version = "0.1.0"
