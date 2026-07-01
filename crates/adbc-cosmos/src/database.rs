@@ -1,0 +1,117 @@
+//! The ADBC [`Database`] object: parses connection configuration from options.
+
+use std::sync::Arc;
+
+use adbc_core::error::Result;
+use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
+use adbc_core::{Database, Optionable};
+use driverbase::error::ErrorHelper as _;
+
+use crate::connection::CosmosConnection;
+use crate::error::ErrorHelper;
+use crate::options;
+
+/// Connection configuration parsed from database-level options, shared (read-only)
+/// with every connection and statement created beneath this database.
+#[derive(Debug, Default, Clone)]
+pub struct DatabaseConfig {
+    /// Cosmos account endpoint URI.
+    pub endpoint: Option<String>,
+    /// Authentication mode: `entra` | `key` | `connection_string`.
+    pub auth: Option<String>,
+    /// Account key (secret; never returned via `get_option`).
+    pub account_key: Option<String>,
+    /// Full connection string (secret; never returned via `get_option`).
+    pub connection_string: Option<String>,
+    /// Default database name.
+    pub database: Option<String>,
+}
+
+#[derive(Default)]
+pub struct CosmosDatabase {
+    config: DatabaseConfig,
+}
+
+impl Database for CosmosDatabase {
+    type ConnectionType = CosmosConnection;
+
+    fn new_connection(&self) -> Result<Self::ConnectionType> {
+        self.new_connection_with_opts(vec![])
+    }
+
+    fn new_connection_with_opts(
+        &self,
+        opts: impl IntoIterator<Item = (OptionConnection, OptionValue)>,
+    ) -> Result<Self::ConnectionType> {
+        let mut connection = CosmosConnection::new(Arc::new(self.config.clone()));
+        for (key, value) in opts {
+            connection.set_option(key, value)?;
+        }
+        Ok(connection)
+    }
+}
+
+impl Optionable for CosmosDatabase {
+    type Option = OptionDatabase;
+
+    fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
+        match &key {
+            // Canonical ADBC keys map onto Cosmos concepts.
+            OptionDatabase::Uri => {
+                self.config.endpoint = Some(options::require_string(options::ENDPOINT, value)?);
+            }
+            OptionDatabase::Password => {
+                self.config.account_key = Some(options::require_string(options::ACCOUNT_KEY, value)?);
+            }
+            OptionDatabase::Other(k) => match k.as_str() {
+                options::ENDPOINT => {
+                    self.config.endpoint = Some(options::require_string(options::ENDPOINT, value)?);
+                }
+                options::AUTH => {
+                    self.config.auth = Some(options::require_string(options::AUTH, value)?);
+                }
+                options::ACCOUNT_KEY => {
+                    self.config.account_key =
+                        Some(options::require_string(options::ACCOUNT_KEY, value)?);
+                }
+                options::CONNECTION_STRING => {
+                    self.config.connection_string =
+                        Some(options::require_string(options::CONNECTION_STRING, value)?);
+                }
+                options::DATABASE => {
+                    self.config.database = Some(options::require_string(options::DATABASE, value)?);
+                }
+                _ => return Err(ErrorHelper::set_unknown_option(&key).to_adbc()),
+            },
+            _ => return Err(ErrorHelper::set_unknown_option(&key).to_adbc()),
+        }
+        Ok(())
+    }
+
+    fn get_option_string(&self, key: Self::Option) -> Result<String> {
+        // Secrets (account key, connection string) are intentionally not readable back.
+        let value = match &key {
+            OptionDatabase::Uri => self.config.endpoint.clone(),
+            OptionDatabase::Other(k) => match k.as_str() {
+                options::ENDPOINT => self.config.endpoint.clone(),
+                options::AUTH => self.config.auth.clone(),
+                options::DATABASE => self.config.database.clone(),
+                _ => None,
+            },
+            _ => None,
+        };
+        value.ok_or_else(|| ErrorHelper::get_unknown_option(&key).to_adbc())
+    }
+
+    fn get_option_bytes(&self, key: Self::Option) -> Result<Vec<u8>> {
+        Err(ErrorHelper::get_unknown_option(&key).to_adbc())
+    }
+
+    fn get_option_int(&self, key: Self::Option) -> Result<i64> {
+        Err(ErrorHelper::get_unknown_option(&key).to_adbc())
+    }
+
+    fn get_option_double(&self, key: Self::Option) -> Result<f64> {
+        Err(ErrorHelper::get_unknown_option(&key).to_adbc())
+    }
+}

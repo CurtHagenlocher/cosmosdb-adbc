@@ -1,0 +1,8 @@
+/target
+# Cloned reference repos used only for API verification — not part of the build.
+/reference
+**/*.rs.bk
+# Secrets / local config
+.env
+*.pem
+local.settings.json

@@ -1,0 +1,23 @@
+[package]
+name = "adbc-cosmos"
+description = "ADBC driver for Azure Cosmos DB (NoSQL / Core SQL API)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+adbc_core.workspace = true
+adbc_ffi = { workspace = true, optional = true }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+driverbase.workspace = true
+
+[features]
+default = ["ffi"]
+# Exports the C ABI entry point (AdbcDriverCosmosDbInit) for loading via a driver manager.
+ffi = ["dep:adbc_ffi"]
+
+[lib]
+crate-type = ["lib", "cdylib"]

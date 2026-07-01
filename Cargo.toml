@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/adbc-cosmos"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/curthagenlocher/cosmosdb-adbc"
+
+[workspace.dependencies]
+# --- ADBC (pinned to the DataFusion-driver skeleton's versions; arrow-adbc main is 0.24) ---
+adbc_core = "0.23.0"
+adbc_ffi = "0.23.0"
+arrow-array = "58"
+arrow-schema = "58"
+# driverbase is git-only (not published); pin to the rev the DataFusion driver resolves to.
+driverbase = { git = "https://github.com/adbc-drivers/driverbase-rs.git", rev = "483f28e8720d1d41ca3e65c0d4a8569f47a17bdb" }
