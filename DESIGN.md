@@ -326,6 +326,21 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
 
 ## 8. Build status
 
+- **Python/ADBC cdylib round-trip — DONE, live-verified (2026-07-01).** `validation/roundtrip.py`
+  loads the built `adbc_cosmos.dll` through `adbc_driver_manager` (entrypoint
+  `AdbcDriverCosmosDbInit`) exactly as a real Python/pyarrow consumer would, proving the whole C
+  ABI / Arrow C Data Interface path — not just the in-process Rust tests. 10/10 checks pass:
+  native/json (single `document` column; the `arrow.json` extension type survives the FFI boundary
+  and is promoted to pyarrow's canonical `JsonType`), native/struct (inferred columns), datafusion
+  cross-container JOIN, and datafusion filter pushdown (`WHERE "mergeOrder" > 25` → 25 rows). See
+  `validation/README.md`. (pyarrow 24 / adbc-driver-manager 1.11 / Python 3.11.)
+- **Subtree folding — investigated, deliberately shelved (2026-07-01).** The pinned engine only
+  cleanly supports `COUNT(*)`; GROUP BY / DISTINCT / multi-aggregates are rejected and ORDER BY /
+  column-aggregates aren't Exact (see §3.2 note + `journal/research/cosmosdb/odbc_driver.md`). The
+  Microsoft ODBC driver (the analog) computes those locally too, validating our "push
+  projection/filter/limit, compute the rest in DataFusion" design. Revisit only if a newer engine
+  rev advertises GroupBy/Distinct.
+
 - **Phase 1 — native dialect DONE, live-verified.** `adbc-cosmos` now executes queries: a shared
   multi-thread Tokio runtime per database (`runtime.rs`) bridges the async transport to the sync
   ADBC boundary; `client.rs` builds a `cosmos-client` handle from options (connstring > key > Entra);
