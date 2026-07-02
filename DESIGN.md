@@ -240,17 +240,19 @@ and beats it on structure.
    library supports decimal encoding (a library limitation we document, not a designed asymmetry —
    revisit when upstream lands it, or hand-roll only if a user needs it sooner).
 2. **Heterogeneous / type-conflicting fields (`heterogeneous`).** These would otherwise crash —
-   `infer_json_schema_from_iterator` **errors** on a field that's a scalar in one doc and an
+   `infer_json_schema_from_iterator` **errors** on a path that's a scalar in one doc and an
    object/array in another, and even for scalar-vs-scalar the `Decoder` rejects the non-string
-   values it inferred as `Utf8`. So conflicting fields are detected up front, **excluded from
-   inference**, and built as standalone columns: **`string`** (default) stringifies to `Utf8`
-   (universally consumable); **`variant`** (feature-gated) carries a self-describing Arrow Variant
-   column via `json_to_variant`. `string` is the effective default because Variant is behind the
-   opt-in `variant` feature. This robustness applies across **all read paths**: `struct` output
-   (`inference.rs`), metadata (`inference::infer_schema`), and the `datafusion` provider
-   (`convert.rs` excludes conflicting fields at infer and stringifies `Utf8`-typed fields at
-   decode — which also tolerates out-of-sample type drift). Detection is **top-level only**
-   (nested conflicts can still crash — a known limitation to revisit).
+   values it inferred as `Utf8`. Fix: a **recursive shape pass** (shared
+   `cosmos_datafusion::normalize`) merges a JSON shape across sampled docs and stringifies exactly
+   the conflicting nodes **at any depth** to `Utf8` before infer/decode — homogeneous nested
+   `Struct`/`List` typing is preserved. A **top-level** conflicting field can instead be carried as
+   a self-describing Arrow Variant column via `json_to_variant` (**`variant`**, feature-gated);
+   everything else (nested conflicts, and top-level in `string` mode) is stringified. `string` is
+   the effective default because Variant is behind the opt-in `variant` feature. Robust across
+   **all read paths**: `struct` output (`inference.rs`), metadata (`inference::infer_schema`), and
+   the `datafusion` provider (`convert.rs`: shape-normalize at infer; schema-guided
+   stringify-where-`Utf8` at decode, which also tolerates out-of-sample type drift). Only the §3.5
+   *type transforms* (below) remain top-level; conflict normalization is fully recursive.
 3. **Dates/datetimes from strings (`infer_temporal`, default `off`).** ISO-8601 string → `Date32`/
    `Timestamp` is pattern-guessing and can misfire on a field that merely looks date-like; the ODBC
    driver doesn't do it, so we default off and make it explicit opt-in.
@@ -393,6 +395,16 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
 
 ## 8. Build status
 
+- **Nested/recursive conflict handling — DONE, live-verified (2026-07-02).** Extended
+  heterogeneous handling to conflicts at *any depth*. New shared `cosmos_datafusion::normalize`:
+  computes a merged JSON *shape* across sampled docs and stringifies exactly the conflicting nodes
+  (nested object fields, array elements) to `Utf8` before infer/decode — previously these caused an
+  infer error (scalar-vs-object) or decode error (non-string into inferred `Utf8`). Used by
+  `struct` output, metadata, and the `datafusion` provider (which also does schema-guided
+  stringify-where-`Utf8` at decode, tolerating out-of-sample drift). The old top-level-only
+  exclusion logic (in `inference.rs` and `convert.rs`) is replaced by this. `mixed` seed container
+  gained a nested-conflict field (`meta.v`). Tests: `normalize` unit tests, `inference` nested unit
+  tests, live (struct nested `meta.v` → Utf8, datafusion on `mixed`), `roundtrip.py` 20/20.
 - **Heterogeneous-field handling — DONE, live-verified (2026-07-02).** Type-conflicting fields
   (a scalar in one doc, an object/array in another) crashed inference/decode everywhere. Now
   detected up front and handled robustly across all read paths: `struct` output builds them as a

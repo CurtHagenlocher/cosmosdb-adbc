@@ -1,24 +1,27 @@
 //! Schema inference for the `struct` output mode (DESIGN §3.5).
 //!
 //! Base inference is arrow-json's `infer_json_schema_from_iterator` (Int64/Float64/Boolean/
-//! Utf8/Struct/List). On top of that we apply a small, opt-in set of type transforms driven
-//! by [`InferenceOptions`], then let arrow-json's `Decoder` coerce the documents into the
-//! transformed schema (it natively decodes JSON numbers into `Decimal128`, RFC-3339 strings
-//! into `Timestamp`/`Date32`, and integers into `Timestamp`, as verified against arrow 58).
+//! Utf8/Struct/List). Type-conflicting fields at **any depth** are first normalized to `Utf8`
+//! strings via the shared [`cosmos_datafusion::normalize`] shape pass (arrow-json's infer/decode
+//! otherwise crash on them); then a small, opt-in set of **top-level** type transforms
+//! ([`InferenceOptions`]) is applied and arrow-json's `Decoder` coerces the documents in (it
+//! natively decodes JSON numbers into `Decimal128`, RFC-3339 strings into `Timestamp`/`Date32`,
+//! and integers into `Timestamp`). A top-level conflicting field can instead be carried as a
+//! self-describing Variant column (`heterogeneous=variant`, `variant` feature).
 //!
-//! Transforms are applied to **top-level** fields only; nested numbers/strings keep the base
-//! inference for now. All knobs default off/float64 so behavior matches plain inference until
-//! a user opts in.
+//! Transforms are top-level only; the conflict *normalization* is fully recursive. All knobs
+//! default off/float64 so behavior matches plain inference until a user opts in.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use adbc_core::error::Result;
-use arrow_array::{ArrayRef, RecordBatch, StringArray};
+use arrow_array::RecordBatch;
 use arrow_json::reader::{ReaderBuilder, infer_json_schema_from_iterator};
 use arrow_schema::{ArrowError, DataType, Field, Schema, TimeUnit};
+use cosmos_datafusion::normalize::{self, DocShape};
 use driverbase::error::ErrorHelper as _;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::error::ErrorHelper;
 
@@ -62,11 +65,11 @@ fn arrow_err(context: &'static str, e: ArrowError) -> adbc_core::error::Error {
     ErrorHelper::internal(context).message(e.to_string()).to_adbc()
 }
 
-/// Build a `struct`-mode batch. Heterogeneous (type-conflicting) fields are handled *outside*
-/// arrow-json — they're excluded from inference (whose `infer_json_schema_from_iterator` errors
-/// on scalar-vs-object conflicts) and the Decoder, and built as standalone columns: a `Variant`
-/// column under `heterogeneous=variant`, else a stringified `Utf8` column. Homogeneous fields
-/// are inferred, type-transformed (§3.5), and decoded normally.
+/// Build a `struct`-mode batch. Type-conflicting fields at any depth are stringified to `Utf8`
+/// by the shared [`normalize`] shape pass before inference/decoding (nested conflicts included);
+/// a top-level conflicting field is instead carried as a self-describing Variant column under
+/// `heterogeneous=variant`. Homogeneous fields are inferred, top-level type-transformed (§3.5),
+/// and decoded normally.
 pub fn build_struct_batch(
     docs: &[Value],
     sample_size: usize,
@@ -77,30 +80,29 @@ pub fn build_struct_batch(
     }
     let sample_n = sample_size.max(1);
     let sample = &docs[..docs.len().min(sample_n)];
-    let profiles = profile_fields(sample);
+    let shape = normalize::infer_doc_shape(sample);
 
-    // Type-conflicting fields, computed BEFORE inference (arrow-json's infer errors on a field
-    // that is a scalar in one doc and an object/array in another). Sorted for deterministic order.
-    let mut heterogeneous: Vec<String> = profiles
-        .iter()
-        .filter(|(_, p)| p.is_heterogeneous())
-        .map(|(name, _)| name.clone())
-        .collect();
-    heterogeneous.sort();
-    let variant_fields = variant_field_set(opts, &heterogeneous);
+    // Top-level conflicting fields become Variant columns (heterogeneous=variant + feature); every
+    // other conflict — nested, or top-level in string mode — is stringified inline by `normalize`.
+    let variant_fields = variant_fields(opts, &shape);
+    let skip: std::collections::HashSet<&str> = variant_fields.iter().map(String::as_str).collect();
+    let normalized: Vec<Value> = docs.iter().map(|d| shape.normalize(d, &skip)).collect();
 
-    // Infer homogeneous fields only (exclude every heterogeneous field so infer won't choke).
-    let base = if heterogeneous.is_empty() {
-        infer_json_schema_from_iterator(sample.iter().map(Ok::<_, ArrowError>))
+    // Infer over the normalized sample. Variant fields are left raw by `normalize`, so drop them
+    // (they'd still be conflicting) — they're rebuilt from the raw documents below.
+    let sample_end = normalized.len().min(sample_n);
+    let base = if variant_fields.is_empty() {
+        infer_json_schema_from_iterator(normalized[..sample_end].iter().map(Ok::<_, ArrowError>))
     } else {
-        let excluded: HashSet<&str> = heterogeneous.iter().map(String::as_str).collect();
-        let reduced: Vec<Value> = sample.iter().map(|d| without_fields(d, &excluded)).collect();
+        let reduced: Vec<Value> =
+            normalized[..sample_end].iter().map(|d| without_fields(d, &skip)).collect();
         infer_json_schema_from_iterator(reduced.iter().map(Ok::<_, ArrowError>))
     }
     .map_err(|e| arrow_err("infer_json_schema", e))?;
 
-    // Decode homogeneous fields with type transforms. Heterogeneous fields aren't in the schema,
-    // so the Decoder ignores them in the documents.
+    // Apply top-level type transforms and decode the normalized documents (variant fields aren't
+    // in the schema, so the Decoder ignores them).
+    let profiles = profile_fields(sample);
     let decode_fields: Vec<Field> = base
         .fields()
         .iter()
@@ -116,31 +118,25 @@ pub fn build_struct_batch(
     let typed_batch = if decode_schema.fields().is_empty() {
         RecordBatch::new_empty(decode_schema.clone())
     } else {
-        decode(decode_schema, docs)?
+        decode(decode_schema, &normalized)?
     };
 
-    if heterogeneous.is_empty() {
+    if variant_fields.is_empty() {
         return Ok(typed_batch);
     }
-
-    // Assemble: decoded homogeneous columns first, then a built column per heterogeneous field.
-    let mut fields: Vec<Field> =
-        typed_batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
-    let mut columns: Vec<ArrayRef> = typed_batch.columns().to_vec();
-    for name in &heterogeneous {
-        let (field, array) = build_het_column(docs, name, variant_fields.contains(name))?;
-        fields.push(field);
-        columns.push(array);
+    #[cfg(feature = "variant")]
+    {
+        assemble_variants(typed_batch, docs, &variant_fields)
     }
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .map_err(|e| arrow_err("assemble", e))
+    #[cfg(not(feature = "variant"))]
+    {
+        Ok(typed_batch) // unreachable: variant_fields is empty without the feature
+    }
 }
 
-/// Infer an Arrow schema tolerant of heterogeneous fields, for metadata (`get_table_schema`,
-/// `get_objects` columns). Homogeneous fields get their base arrow-json types; type-conflicting
-/// fields are represented as `Utf8` (so `infer_json_schema_from_iterator`, which errors on
-/// scalar-vs-object conflicts, doesn't choke). No §3.5 transforms — those are query-output knobs.
-/// Returns the raw `ArrowError` so callers map it into their own error flavor.
+/// Infer an Arrow schema tolerant of type-conflicting fields at any depth, for metadata
+/// (`get_table_schema`, `get_objects` columns). Conflicting fields are normalized to `Utf8`; no
+/// §3.5 transforms (those are query-output knobs). Returns the raw `ArrowError` for the caller.
 pub fn infer_schema(
     docs: &[Value],
     sample_size: usize,
@@ -150,108 +146,76 @@ pub fn infer_schema(
     }
     let sample_n = sample_size.max(1);
     let sample = &docs[..docs.len().min(sample_n)];
-    let profiles = profile_fields(sample);
-
-    let mut heterogeneous: Vec<String> = profiles
-        .iter()
-        .filter(|(_, p)| p.is_heterogeneous())
-        .map(|(name, _)| name.clone())
-        .collect();
-    heterogeneous.sort();
-
-    let base = if heterogeneous.is_empty() {
-        infer_json_schema_from_iterator(sample.iter().map(Ok::<_, ArrowError>))?
-    } else {
-        let excluded: HashSet<&str> = heterogeneous.iter().map(String::as_str).collect();
-        let reduced: Vec<Value> = sample.iter().map(|d| without_fields(d, &excluded)).collect();
-        infer_json_schema_from_iterator(reduced.iter().map(Ok::<_, ArrowError>))?
-    };
-
-    let mut fields: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
-    for name in &heterogeneous {
-        fields.push(Field::new(name, DataType::Utf8, true));
-    }
-    Ok(Arc::new(Schema::new(fields)))
+    let shape = normalize::infer_doc_shape(sample);
+    let no_skip = std::collections::HashSet::new();
+    let normalized: Vec<Value> = sample.iter().map(|d| shape.normalize(d, &no_skip)).collect();
+    let schema = infer_json_schema_from_iterator(normalized.iter().map(Ok::<_, ArrowError>))?;
+    Ok(Arc::new(schema))
 }
 
-/// Heterogeneous fields to carry as Variant columns — all of them under `heterogeneous=variant`,
-/// none otherwise. Always empty without the `variant` feature.
+/// Top-level conflicting fields to carry as Variant columns (under `heterogeneous=variant`).
+/// Always empty without the `variant` feature.
 #[cfg(feature = "variant")]
-fn variant_field_set(opts: &InferenceOptions, heterogeneous: &[String]) -> HashSet<String> {
+fn variant_fields(opts: &InferenceOptions, shape: &DocShape) -> std::collections::HashSet<String> {
     if opts.heterogeneous == HeterogeneousMode::Variant {
-        heterogeneous.iter().cloned().collect()
+        shape.top_level_conflicts().into_iter().collect()
     } else {
-        HashSet::new()
+        std::collections::HashSet::new()
     }
 }
 
 #[cfg(not(feature = "variant"))]
-fn variant_field_set(_opts: &InferenceOptions, _heterogeneous: &[String]) -> HashSet<String> {
-    HashSet::new()
+fn variant_fields(_opts: &InferenceOptions, _shape: &DocShape) -> std::collections::HashSet<String> {
+    std::collections::HashSet::new()
 }
 
-/// Build the column for one heterogeneous field: a `Variant` column when `as_variant`, else a
-/// stringified `Utf8` column.
-fn build_het_column(docs: &[Value], field: &str, as_variant: bool) -> Result<(Field, ArrayRef)> {
-    #[cfg(feature = "variant")]
-    if as_variant {
-        return build_variant_column(docs, field);
-    }
-    let _ = as_variant; // unused without the `variant` feature (always false)
-    Ok(build_string_column(docs, field))
-}
-
-/// A `Utf8` column of one field's per-document values, stringifying non-string scalars/structs;
-/// absent or JSON-null values become nulls.
-fn build_string_column(docs: &[Value], field: &str) -> (Field, ArrayRef) {
-    let values: Vec<Option<String>> = docs
-        .iter()
-        .map(|d| match d.get(field) {
-            None | Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(s.clone()),
-            // numbers → "123", booleans → "true", objects/arrays → compact JSON.
-            Some(v) => Some(v.to_string()),
-        })
-        .collect();
-    let array: ArrayRef = Arc::new(StringArray::from(values));
-    (Field::new(field, DataType::Utf8, true), array)
-}
-
-/// A self-describing Arrow **Variant** column of one field's per-document values
-/// (`json_to_variant`); absent or JSON-null values become nulls.
+/// Reassemble the decoded homogeneous columns plus a self-describing Variant column
+/// (`json_to_variant`, from the raw documents) for each top-level conflicting field.
 #[cfg(feature = "variant")]
-fn build_variant_column(docs: &[Value], field: &str) -> Result<(Field, ArrayRef)> {
+fn assemble_variants(
+    typed_batch: RecordBatch,
+    docs: &[Value],
+    variant_fields: &std::collections::HashSet<String>,
+) -> Result<RecordBatch> {
     const EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
     const ARROW_VARIANT: &str = "arrow.parquet.variant";
 
-    let values: Vec<Option<String>> = docs
-        .iter()
-        .map(|d| match d.get(field) {
-            None | Some(Value::Null) => None,
-            Some(v) => Some(v.to_string()),
-        })
-        .collect();
-    let input: ArrayRef = Arc::new(StringArray::from(values));
-    let variant_array = parquet_variant_compute::json_to_variant(&input)
-        .map_err(|e| arrow_err("json_to_variant", e))?;
-    let array: ArrayRef = variant_array.into();
-    let metadata = HashMap::from([(EXTENSION_NAME_KEY.to_string(), ARROW_VARIANT.to_string())]);
-    let field = Field::new(field, array.data_type().clone(), true).with_metadata(metadata);
-    Ok((field, array))
+    let mut fields: Vec<Field> =
+        typed_batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+    let mut columns: Vec<arrow_array::ArrayRef> = typed_batch.columns().to_vec();
+
+    let mut names: Vec<&String> = variant_fields.iter().collect();
+    names.sort();
+    for name in names {
+        let values: Vec<Option<String>> = docs
+            .iter()
+            .map(|d| match d.get(name) {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(v.to_string()),
+            })
+            .collect();
+        let input: arrow_array::ArrayRef = Arc::new(arrow_array::StringArray::from(values));
+        let variant_array = parquet_variant_compute::json_to_variant(&input)
+            .map_err(|e| arrow_err("json_to_variant", e))?;
+        let array: arrow_array::ArrayRef = variant_array.into();
+        let metadata = HashMap::from([(EXTENSION_NAME_KEY.to_string(), ARROW_VARIANT.to_string())]);
+        fields.push(Field::new(name, array.data_type().clone(), true).with_metadata(metadata));
+        columns.push(array);
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| arrow_err("assemble", e))
 }
 
-/// A copy of `doc` with the named fields removed (used to keep heterogeneous fields out of
+/// A copy of `doc` with the named top-level fields removed (keeps Variant fields out of
 /// arrow-json inference).
-fn without_fields(doc: &Value, exclude: &HashSet<&str>) -> Value {
+fn without_fields(doc: &Value, exclude: &std::collections::HashSet<&str>) -> Value {
     match doc {
-        Value::Object(map) => {
-            let kept: Map<String, Value> = map
-                .iter()
+        Value::Object(map) => Value::Object(
+            map.iter()
                 .filter(|(k, _)| !exclude.contains(k.as_str()))
                 .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            Value::Object(kept)
-        }
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -296,50 +260,31 @@ fn decide_type(
     base.clone()
 }
 
-// ── field profiling ─────────────────────────────────────────────────────────
+// ── field profiling (top-level, for temporal inference) ──────────────────────
 
-/// The JSON kinds a field takes across the sample (integers and floats both count as
-/// `Number`, so a numeric field is never "heterogeneous"), plus temporal-string tallies.
+/// Per-field tallies over the sample used to decide temporal inference: a field is treated as a
+/// date/datetime only if *every* non-null value is an ISO-8601 date/datetime string.
 #[derive(Default)]
 struct FieldProfile {
-    kinds: HashSet<Kind>,
     non_null: usize,
     iso_date: usize,
     iso_datetime: usize,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Kind {
-    Bool,
-    Number,
-    String,
-    Object,
-    Array,
-}
-
 impl FieldProfile {
     fn observe(&mut self, v: &Value) {
-        let kind = match v {
-            Value::Null => return,
-            Value::Bool(_) => Kind::Bool,
-            Value::Number(_) => Kind::Number,
+        match v {
+            Value::Null => {}
             Value::String(s) => {
                 if is_iso_datetime(s) {
                     self.iso_datetime += 1;
                 } else if is_iso_date(s) {
                     self.iso_date += 1;
                 }
-                Kind::String
+                self.non_null += 1;
             }
-            Value::Object(_) => Kind::Object,
-            Value::Array(_) => Kind::Array,
-        };
-        self.kinds.insert(kind);
-        self.non_null += 1;
-    }
-
-    fn is_heterogeneous(&self) -> bool {
-        self.kinds.len() > 1
+            _ => self.non_null += 1,
+        }
     }
 
     fn all_datetime(&self) -> bool {
@@ -475,6 +420,41 @@ mod tests {
         let docs = vec![json!({"o": {"a": 1}}), json!({"o": {"a": 2}})];
         let s = schema_of(&docs, &InferenceOptions::default());
         assert!(matches!(dtype(&s, "o"), DataType::Struct(_)));
+    }
+
+    #[test]
+    fn nested_scalar_conflict_becomes_struct_of_utf8() {
+        // a.b is int in one doc, string in another — previously decode-crashed.
+        let docs = vec![json!({"a": {"b": 1}}), json!({"a": {"b": "x"}})];
+        let batch = build_struct_batch(&docs, 1000, &InferenceOptions::default()).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let schema = batch.schema();
+        let DataType::Struct(fields) = dtype(&schema, "a") else {
+            panic!("a should be a Struct, got {:?}", dtype(&schema, "a"));
+        };
+        let b = fields.iter().find(|f| f.name() == "b").unwrap();
+        assert_eq!(b.data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn nested_scalar_vs_object_conflict_does_not_crash() {
+        // a.b is a scalar in one doc, an object in another — previously an *infer* error.
+        let docs = vec![json!({"a": {"b": 1}}), json!({"a": {"b": {"c": 1}}})];
+        let batch = build_struct_batch(&docs, 1000, &InferenceOptions::default()).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert!(matches!(dtype(&batch.schema(), "a"), DataType::Struct(_)));
+    }
+
+    #[test]
+    fn array_element_conflict_becomes_list_of_utf8() {
+        let docs = vec![json!({"t": [1, 2]}), json!({"t": ["x"]})];
+        let batch = build_struct_batch(&docs, 1000, &InferenceOptions::default()).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let schema = batch.schema();
+        let DataType::List(field) = dtype(&schema, "t") else {
+            panic!("t should be a List, got {:?}", dtype(&schema, "t"));
+        };
+        assert_eq!(field.data_type(), &DataType::Utf8);
     }
 
     #[cfg(feature = "variant")]

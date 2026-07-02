@@ -102,11 +102,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(e) => println!("create_container: {e} (continuing — it may already exist)"),
     }
     let mixed_client = db.container_client(mixed);
+    // `val` conflicts at the top level; `meta.v` conflicts *nested* (number / string / object /
+    // null) to exercise recursive conflict normalization.
     let mixed_docs = [
-        json!({ "id": "m0", "pk": "p", "val": 42 }),
-        json!({ "id": "m1", "pk": "p", "val": "hello" }),
-        json!({ "id": "m2", "pk": "p", "val": { "nested": true } }),
-        json!({ "id": "m3", "pk": "p", "val": null }),
+        json!({ "id": "m0", "pk": "p", "val": 42, "meta": { "v": 1 } }),
+        json!({ "id": "m1", "pk": "p", "val": "hello", "meta": { "v": "two" } }),
+        json!({ "id": "m2", "pk": "p", "val": { "nested": true }, "meta": { "v": { "deep": 3 } } }),
+        json!({ "id": "m3", "pk": "p", "val": null, "meta": { "v": null } }),
     ];
     for doc in &mixed_docs {
         mixed_client.upsert_item("p", doc, None).await?;

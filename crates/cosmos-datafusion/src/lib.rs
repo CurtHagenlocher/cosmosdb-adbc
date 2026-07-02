@@ -9,6 +9,7 @@
 
 mod catalog;
 mod convert;
+pub mod normalize;
 mod predicate;
 mod provider;
 

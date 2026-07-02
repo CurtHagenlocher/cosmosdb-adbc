@@ -341,8 +341,14 @@ fn struct_heterogeneous_field_as_string() {
 
     let reader = stmt.execute().expect("execute");
     let schema = reader.schema();
-    // The type-conflicting `val` field widens to Utf8 (a naive decode would crash here).
+    // The top-level conflicting `val` field widens to Utf8 (a naive decode would crash here).
     assert_eq!(schema.field_with_name("val").unwrap().data_type(), &DataType::Utf8);
+    // The *nested* conflict `meta.v` is normalized to Utf8 inside the struct.
+    let DataType::Struct(meta) = schema.field_with_name("meta").unwrap().data_type() else {
+        panic!("meta should be a Struct");
+    };
+    let v = meta.iter().find(|f| f.name() == "v").expect("meta.v");
+    assert_eq!(v.data_type(), &DataType::Utf8);
     let rows: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
     assert_eq!(rows, 4);
 }
