@@ -462,7 +462,11 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
   native/json (single `document` column; the `arrow.json` extension type survives the FFI boundary
   and is promoted to pyarrow's canonical `JsonType`), native/struct (inferred columns), datafusion
   cross-container JOIN, and datafusion filter pushdown (`WHERE "mergeOrder" > 25` → 25 rows). See
-  `validation/README.md`. (pyarrow 24 / adbc-driver-manager 1.11 / Python 3.11.)
+  `validation/README.md`. (pyarrow 24 / adbc-driver-manager 1.11 / Python 3.11.) **Since expanded**
+  to cover struct inference knobs, metadata, and heterogeneous handling; the harness auto-detects the
+  `variant` feature (**20 pass / 1 skip** on a default build; **25 pass** with `--features variant`,
+  where `output=variant` and `heterogeneous=variant` are confirmed to cross the FFI as
+  `arrow.parquet.variant`).
 - **Subtree folding — investigated, deliberately shelved (2026-07-01).** The pinned engine only
   cleanly supports `COUNT(*)`; GROUP BY / DISTINCT / multi-aggregates are rejected and ORDER BY /
   column-aggregates aren't Exact (see §3.2 note + `journal/research/cosmosdb/odbc_driver.md`). The

@@ -85,6 +85,7 @@ def run_query(driver: str, stmt_opts: dict[str, str], sql: str) -> pyarrow.Table
 
 PASSED = 0
 FAILED = 0
+SKIPPED = 0
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -95,6 +96,12 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     else:
         FAILED += 1
         print(f"  FAIL: {name} — {detail}")
+
+
+def skip(reason: str) -> None:
+    global SKIPPED
+    SKIPPED += 1
+    print(f"  SKIP: {reason}")
 
 
 def ext_name(field: pyarrow.Field) -> str | None:
@@ -208,6 +215,44 @@ def test_heterogeneous_string(driver: str) -> None:
     check("4 rows returned", t.num_rows == 4, str(t.num_rows))
 
 
+def test_variant(driver: str) -> None:
+    print("[variant feature] output=variant + heterogeneous=variant")
+    # Probe: output=variant errors unless the driver was built with --features variant.
+    try:
+        whole = run_query(
+            driver,
+            {"adbc.cosmos.dialect": "native", "adbc.cosmos.container": "items",
+             "adbc.cosmos.output": "variant"},
+            "SELECT * FROM c",
+        )
+    except Exception as e:  # noqa: BLE001
+        if "features variant" in str(e) or "requires building" in str(e):
+            skip("driver not built with --features variant (rebuild to run these checks)")
+            return
+        raise
+
+    # output=variant: whole document as a single Arrow Variant column.
+    check("output=variant single 'document' column",
+          whole.num_columns == 1 and whole.schema.field(0).name == "document",
+          str(whole.schema.names))
+    check("output=variant document is arrow.parquet.variant",
+          ext_name(whole.schema.field(0)) == "arrow.parquet.variant",
+          str(ext_name(whole.schema.field(0))))
+    check("output=variant 50 rows", whole.num_rows == 50, str(whole.num_rows))
+
+    # heterogeneous=variant: the conflicting `val` field becomes a per-field Variant column.
+    mixed = run_query(
+        driver,
+        {"adbc.cosmos.dialect": "native", "adbc.cosmos.container": "mixed",
+         "adbc.cosmos.output": "struct", "adbc.cosmos.heterogeneous": "variant"},
+        "SELECT * FROM c",
+    )
+    check("heterogeneous=variant 'val' is a Variant column",
+          ext_name(mixed.schema.field("val")) == "arrow.parquet.variant",
+          str(ext_name(mixed.schema.field("val"))))
+    check("heterogeneous=variant 4 rows", mixed.num_rows == 4, str(mixed.num_rows))
+
+
 def test_metadata(driver: str) -> None:
     print("[connection metadata] get_table_types / get_table_schema / get_objects")
     db = open_database(driver)
@@ -263,6 +308,7 @@ def main() -> int:
         test_datafusion_filter_pushdown,
         test_struct_inference_knobs,
         test_heterogeneous_string,
+        test_variant,
         test_metadata,
     ):
         try:
@@ -272,7 +318,8 @@ def main() -> int:
             FAILED += 1
             print(f"  FAIL: {test.__name__} raised {type(e).__name__}: {e}")
         print()
-    print(f"=== {PASSED} passed, {FAILED} failed ===")
+    skipped = f", {SKIPPED} skipped" if SKIPPED else ""
+    print(f"=== {PASSED} passed, {FAILED} failed{skipped} ===")
     return 1 if FAILED else 0
 
 
