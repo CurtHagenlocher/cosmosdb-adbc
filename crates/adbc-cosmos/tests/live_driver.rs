@@ -302,6 +302,81 @@ fn struct_inference_knobs_decimal_and_epoch() {
 
 #[test]
 #[ignore = "requires the local Cosmos emulator (run cosmos-client's seed example first)"]
+fn datafusion_dialect_handles_heterogeneous_container() {
+    // The datafusion provider infers/decodes `mixed` whose `val` field conflicts (number /
+    // string / object) — it must not crash (val is carried as Utf8).
+    fn run_df<C: Connection>(conn: &mut C, sql: &str) -> usize {
+        let mut stmt = conn.new_statement().expect("new_statement");
+        stmt.set_option(
+            OptionStatement::Other("adbc.cosmos.dialect".into()),
+            OptionValue::String("datafusion".into()),
+        )
+        .expect("set dialect");
+        stmt.set_sql_query(sql).expect("set query");
+        stmt.execute()
+            .expect("execute")
+            .map(|b| b.expect("batch").num_rows())
+            .sum()
+    }
+    let mut conn = open_connection();
+    assert_eq!(run_df(&mut conn, "SELECT id, val FROM mixed"), 4);
+}
+
+#[test]
+#[ignore = "requires the local Cosmos emulator (run cosmos-client's seed example first)"]
+fn struct_heterogeneous_field_as_string() {
+    use arrow_schema::DataType;
+
+    let mut conn = open_connection();
+    let mut stmt = conn.new_statement().expect("new_statement");
+    for (k, v) in [
+        ("adbc.cosmos.container", "mixed"),
+        ("adbc.cosmos.output", "struct"),
+        ("adbc.cosmos.heterogeneous", "string"),
+    ] {
+        stmt.set_option(OptionStatement::Other(k.into()), OptionValue::String(v.into()))
+            .expect("set option");
+    }
+    stmt.set_sql_query("SELECT * FROM c").expect("set query");
+
+    let reader = stmt.execute().expect("execute");
+    let schema = reader.schema();
+    // The type-conflicting `val` field widens to Utf8 (a naive decode would crash here).
+    assert_eq!(schema.field_with_name("val").unwrap().data_type(), &DataType::Utf8);
+    let rows: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
+    assert_eq!(rows, 4);
+}
+
+#[cfg(feature = "variant")]
+#[test]
+#[ignore = "requires the local Cosmos emulator + --features variant (run seed first)"]
+fn struct_heterogeneous_field_as_variant() {
+    let mut conn = open_connection();
+    let mut stmt = conn.new_statement().expect("new_statement");
+    for (k, v) in [
+        ("adbc.cosmos.container", "mixed"),
+        ("adbc.cosmos.output", "struct"),
+        ("adbc.cosmos.heterogeneous", "variant"),
+    ] {
+        stmt.set_option(OptionStatement::Other(k.into()), OptionValue::String(v.into()))
+            .expect("set option");
+    }
+    stmt.set_sql_query("SELECT * FROM c").expect("set query");
+
+    let reader = stmt.execute().expect("execute");
+    let schema = reader.schema();
+    // The conflicting `val` field is carried as a self-describing Variant column.
+    let val = schema.field_with_name("val").unwrap();
+    assert_eq!(
+        val.metadata().get("ARROW:extension:name").map(String::as_str),
+        Some("arrow.parquet.variant"),
+    );
+    let rows: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
+    assert_eq!(rows, 4);
+}
+
+#[test]
+#[ignore = "requires the local Cosmos emulator (run cosmos-client's seed example first)"]
 fn metadata_get_table_types_lists_table() {
     let conn = open_connection();
     let reader = conn.get_table_types().expect("get_table_types");

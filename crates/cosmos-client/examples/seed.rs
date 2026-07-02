@@ -88,6 +88,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("seeded 5 documents into '{database}/{categories}'");
 
+    // A third container with a deliberately type-conflicting field `val` (number / string /
+    // object across documents) to exercise struct-mode heterogeneous handling
+    // (adbc.cosmos.heterogeneous = string | variant).
+    let mixed = "mixed";
+    let mixed_props = ContainerProperties {
+        id: mixed.into(),
+        partition_key: "/pk".into(),
+        ..Default::default()
+    };
+    match db.create_container(mixed_props, None).await {
+        Ok(_) => println!("created container '{mixed}' (partition key /pk)"),
+        Err(e) => println!("create_container: {e} (continuing — it may already exist)"),
+    }
+    let mixed_client = db.container_client(mixed);
+    let mixed_docs = [
+        json!({ "id": "m0", "pk": "p", "val": 42 }),
+        json!({ "id": "m1", "pk": "p", "val": "hello" }),
+        json!({ "id": "m2", "pk": "p", "val": { "nested": true } }),
+        json!({ "id": "m3", "pk": "p", "val": null }),
+    ];
+    for doc in &mixed_docs {
+        mixed_client.upsert_item("p", doc, None).await?;
+    }
+    println!("seeded {} documents into '{database}/{mixed}'", mixed_docs.len());
+
     println!("next: cargo run -p cosmos-client --example spike_a");
     Ok(())
 }

@@ -11,8 +11,7 @@ use std::sync::Arc;
 
 use adbc_core::error::Result;
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use arrow_json::reader::infer_json_schema_from_iterator;
-use arrow_schema::{ArrowError, DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use driverbase::error::ErrorHelper as _;
 use serde_json::Value;
 
@@ -20,7 +19,7 @@ use crate::error::ErrorHelper;
 
 /// Map an Arrow error into an ADBC error with a bit of context.
 #[cfg(feature = "variant")]
-fn arrow_err(context: &'static str, e: ArrowError) -> adbc_core::error::Error {
+fn arrow_err(context: &'static str, e: arrow_schema::ArrowError) -> adbc_core::error::Error {
     ErrorHelper::internal(context)
         .message(e.to_string())
         .to_adbc()
@@ -45,29 +44,6 @@ pub fn build_json_batch(docs: &[Value]) -> Result<RecordBatch> {
             .message(e.to_string())
             .to_adbc()
     })
-}
-
-/// Build a batch by inferring an Arrow `Struct` schema from the first `sample_size`
-/// documents and projecting all documents into it (struct output mode).
-///
-/// Fields absent from a given document become null; fields that appear only *after* the
-/// sample are dropped (the documented cost of sampling — default to JSON for fully
-/// heterogeneous data).
-/// Infer an Arrow `Struct` schema from the first `sample_size` documents. Shared by the
-/// `struct` output builder and the connection metadata surface (`get_objects` columns,
-/// `get_table_schema`). Empty input yields an empty schema. Returns the raw `ArrowError` so
-/// callers can map it into whichever error flavor they need (`driverbase` vs ADBC).
-pub fn infer_struct_schema(
-    docs: &[Value],
-    sample_size: usize,
-) -> std::result::Result<Arc<Schema>, ArrowError> {
-    if docs.is_empty() {
-        return Ok(Arc::new(Schema::empty()));
-    }
-    let sample_n = sample_size.max(1);
-    let schema =
-        infer_json_schema_from_iterator(docs.iter().take(sample_n).map(Ok::<_, ArrowError>))?;
-    Ok(Arc::new(schema))
 }
 
 /// Build a single-column Arrow **Variant** batch from documents (variant output mode).

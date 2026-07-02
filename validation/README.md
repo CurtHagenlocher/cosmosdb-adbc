@@ -17,6 +17,8 @@ Loads `target/debug/adbc_cosmos.dll` via `adbc_driver_manager` and asserts:
 - **struct inference knobs (§3.5)** — `number_inference=decimal` + `epoch_fields` yield a
   `decimal128(20,4)` `value` column and a `timestamp[s]` `_ts` column (both survive the FFI), with
   integral `mergeOrder` staying `int64`.
+- **struct heterogeneous field** — a type-conflicting `val` (number/string/object across docs) in
+  the `mixed` container widens to `string` (default build) instead of crashing the decode.
 - **connection metadata** — `get_table_types` (`["table"]`), `get_table_schema` (inferred `items`
   columns), and `get_objects` navigated catalog→schema→table→columns (lists the `spikedb` catalog,
   `items`+`categories` containers, and `items` columns).
@@ -38,5 +40,5 @@ emulator endpoint + key (not secrets).
 python validation/roundtrip.py
 ```
 
-Exit code is non-zero if any check fails. Verified 2026-07-01: 18/18 pass
+Exit code is non-zero if any check fails. Verified 2026-07-02: 20/20 pass
 (pyarrow 24.0.0, adbc-driver-manager 1.11.0, Python 3.11).

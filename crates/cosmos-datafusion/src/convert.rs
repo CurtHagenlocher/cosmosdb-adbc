@@ -1,26 +1,122 @@
 //! JSON ↔ Arrow helpers for the DataFusion federation layer.
 
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_json::reader::{ReaderBuilder, infer_json_schema_from_iterator};
-use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
-use serde_json::Value;
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use serde_json::{Map, Value};
 
-/// Infer an Arrow schema from sampled documents.
+/// Infer an Arrow schema from sampled documents, tolerant of type-conflicting fields.
+///
+/// `infer_json_schema_from_iterator` errors when a field is a scalar in one document and an
+/// object/array in another, so we detect heterogeneous top-level fields up front, exclude them
+/// from inference, and represent them as `Utf8` (decoded via [`decode_docs`]'s stringify path).
 pub(crate) fn infer_schema(docs: &[Value]) -> Result<SchemaRef, ArrowError> {
-    let schema = infer_json_schema_from_iterator(docs.iter().map(Ok::<_, ArrowError>))?;
-    Ok(Arc::new(schema))
+    let heterogeneous = heterogeneous_fields(docs);
+    let base = if heterogeneous.is_empty() {
+        infer_json_schema_from_iterator(docs.iter().map(Ok::<_, ArrowError>))?
+    } else {
+        let reduced: Vec<Value> = docs.iter().map(|d| without_fields(d, &heterogeneous)).collect();
+        infer_json_schema_from_iterator(reduced.iter().map(Ok::<_, ArrowError>))?
+    };
+
+    let mut fields: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
+    let mut het: Vec<&String> = heterogeneous.iter().collect();
+    het.sort();
+    for name in het {
+        fields.push(Field::new(name, DataType::Utf8, true));
+    }
+    Ok(Arc::new(Schema::new(fields)))
 }
 
-/// Project documents into a known Arrow schema.
+/// Project documents into a known Arrow schema. For any field the schema types as `Utf8`, a
+/// non-string JSON value is stringified first — so heterogeneous fields (inferred as `Utf8`) and
+/// out-of-sample type drift don't fail the decode.
 pub(crate) fn decode_docs(schema: SchemaRef, docs: &[Value]) -> Result<Vec<RecordBatch>, ArrowError> {
     if docs.is_empty() {
         return Ok(Vec::new());
     }
+    let utf8_fields: HashSet<&str> = schema
+        .fields()
+        .iter()
+        .filter(|f| matches!(f.data_type(), DataType::Utf8))
+        .map(|f| f.name().as_str())
+        .collect();
+    let processed: Cow<[Value]> = if utf8_fields.is_empty() {
+        Cow::Borrowed(docs)
+    } else {
+        Cow::Owned(docs.iter().map(|d| stringify_fields(d, &utf8_fields)).collect())
+    };
+
     let mut decoder = ReaderBuilder::new(schema).build_decoder()?;
-    decoder.serialize(docs)?;
+    decoder.serialize(&processed)?;
     Ok(decoder.flush()?.into_iter().collect())
+}
+
+/// Top-level fields whose sampled values take more than one JSON kind (integers and floats both
+/// count as numbers, so a numeric field is never flagged).
+fn heterogeneous_fields(docs: &[Value]) -> HashSet<String> {
+    let mut kinds: HashMap<String, HashSet<u8>> = HashMap::new();
+    for doc in docs {
+        if let Value::Object(map) = doc {
+            for (k, v) in map {
+                if let Some(kind) = json_kind(v) {
+                    kinds.entry(k.clone()).or_default().insert(kind);
+                }
+            }
+        }
+    }
+    kinds.into_iter().filter(|(_, ks)| ks.len() > 1).map(|(k, _)| k).collect()
+}
+
+fn json_kind(v: &Value) -> Option<u8> {
+    match v {
+        Value::Null => None,
+        Value::Bool(_) => Some(0),
+        Value::Number(_) => Some(1),
+        Value::String(_) => Some(2),
+        Value::Array(_) => Some(3),
+        Value::Object(_) => Some(4),
+    }
+}
+
+fn without_fields(doc: &Value, exclude: &HashSet<String>) -> Value {
+    match doc {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(k, _)| !exclude.contains(k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Stringify non-string values for the named fields (numbers → `"123"`, objects/arrays → JSON).
+fn stringify_fields(doc: &Value, fields: &HashSet<&str>) -> Value {
+    match doc {
+        Value::Object(map) => {
+            let out: Map<String, Value> = map
+                .iter()
+                .map(|(k, v)| {
+                    let nv = if fields.contains(k.as_str()) {
+                        match v {
+                            Value::Null | Value::String(_) => v.clone(),
+                            other => Value::String(other.to_string()),
+                        }
+                    } else {
+                        v.clone()
+                    };
+                    (k.clone(), nv)
+                })
+                .collect();
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
 }
 
 /// Build the projected output schema and the Cosmos SQL for a scan.

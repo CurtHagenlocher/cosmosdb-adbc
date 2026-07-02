@@ -199,7 +199,7 @@ Three crates, layered so DataFusion/Arrow/ADBC types never leak into transport (
 | `adbc.cosmos.sample_size` | Statement/Connection | int (e.g. 1000) | docs to sample for `struct` inference |
 | `adbc.cosmos.number_inference` | Statement | `float64` (default) \| `decimal` | numeric fidelity (see §3.5) — applied uniformly |
 | `adbc.cosmos.decimal` | Statement | `p,s` (e.g. `38,9`) | precision,scale when `number_inference=decimal` |
-| `adbc.cosmos.heterogeneous` | Statement | `string` (default) | fallback for type-conflicting fields (`struct`); `variant` reserved (feature-gated, not yet impl) |
+| `adbc.cosmos.heterogeneous` | Statement | `string` (default) \| `variant` | representation for type-conflicting `struct` fields; `variant` needs the `variant` feature |
 | `adbc.cosmos.infer_temporal` | Statement | `off` (default) \| `on` | infer `Date`/`Timestamp` from ISO-8601 strings (`struct`) |
 | `adbc.cosmos.epoch_fields` | Statement | comma list | fields to read as epoch timestamps; `name:s`/`name:ms` |
 | `adbc.cosmos.max_retries` | Connection | int | 429 throttling retries |
@@ -239,14 +239,18 @@ and beats it on structure.
    the decimal typing applies to `struct` columns today; `variant` numbers stay `Double` until the
    library supports decimal encoding (a library limitation we document, not a designed asymmetry —
    revisit when upstream lands it, or hand-roll only if a user needs it sooner).
-2. **Heterogeneous / type-conflicting fields (`heterogeneous`).** These would otherwise
-   *decode-crash* (arrow-json infers a conflicting field as `Utf8`, but its `Decoder` then rejects
-   the non-string values — so this is a robustness fix, not just a nicety). **Implemented: widen
-   to `Utf8`, stringifying non-string values** (universally consumable). `variant` (per-field, self-
-   describing) was the intended default, but Variant is behind the opt-in `variant` cargo feature
-   and can't produce a column in a stock build — so **`string` is the effective default**;
-   per-field `variant` is a **feature-gated follow-up**. Conflict detection is top-level only
-   (nested conflicts can still decode-crash — a known limitation to revisit).
+2. **Heterogeneous / type-conflicting fields (`heterogeneous`).** These would otherwise crash —
+   `infer_json_schema_from_iterator` **errors** on a field that's a scalar in one doc and an
+   object/array in another, and even for scalar-vs-scalar the `Decoder` rejects the non-string
+   values it inferred as `Utf8`. So conflicting fields are detected up front, **excluded from
+   inference**, and built as standalone columns: **`string`** (default) stringifies to `Utf8`
+   (universally consumable); **`variant`** (feature-gated) carries a self-describing Arrow Variant
+   column via `json_to_variant`. `string` is the effective default because Variant is behind the
+   opt-in `variant` feature. This robustness applies across **all read paths**: `struct` output
+   (`inference.rs`), metadata (`inference::infer_schema`), and the `datafusion` provider
+   (`convert.rs` excludes conflicting fields at infer and stringifies `Utf8`-typed fields at
+   decode — which also tolerates out-of-sample type drift). Detection is **top-level only**
+   (nested conflicts can still crash — a known limitation to revisit).
 3. **Dates/datetimes from strings (`infer_temporal`, default `off`).** ISO-8601 string → `Date32`/
    `Timestamp` is pattern-guessing and can misfire on a field that merely looks date-like; the ODBC
    driver doesn't do it, so we default off and make it explicit opt-in.
@@ -389,6 +393,15 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
 
 ## 8. Build status
 
+- **Heterogeneous-field handling — DONE, live-verified (2026-07-02).** Type-conflicting fields
+  (a scalar in one doc, an object/array in another) crashed inference/decode everywhere. Now
+  detected up front and handled robustly across all read paths: `struct` output builds them as a
+  stringified `Utf8` column (default) or, with the `variant` feature, a self-describing Arrow
+  **Variant** column (`heterogeneous=variant`); metadata (`inference::infer_schema`) and the
+  `datafusion` provider (`convert.rs`) exclude them from arrow-json inference and represent them as
+  `Utf8` (the provider also stringifies `Utf8`-typed values at decode, tolerating out-of-sample
+  drift). Seed gained a `mixed` container (conflicting `val`). Tests: unit (both feature sets),
+  live (struct string + variant, datafusion on `mixed`), `validation/roundtrip.py` 20/20.
 - **Per-container schema caching — DONE (2026-07-02).** The `datafusion` dialect previously
   re-sampled a container on every `CosmosSchemaProvider::table()` resolution (and rebuilt the
   provider per query). Added `cosmos_datafusion::SchemaCache` (`Mutex<HashMap<(db, container),

@@ -182,11 +182,14 @@ fn parse_decimal(value: &str) -> Result<(u8, i8)> {
 fn parse_heterogeneous(value: &str) -> Result<HeterogeneousMode> {
     match value {
         "string" => Ok(HeterogeneousMode::String),
+        #[cfg(feature = "variant")]
+        "variant" => Ok(HeterogeneousMode::Variant),
+        #[cfg(not(feature = "variant"))]
         "variant" => Err(opt_err(format_args!(
-            "heterogeneous='variant' is not implemented yet; use 'string'"
+            "heterogeneous='variant' requires building the driver with --features variant"
         ))),
         other => Err(opt_err(format_args!(
-            "invalid heterogeneous '{other}' (expected 'string')"
+            "invalid heterogeneous '{other}' (expected 'string' or 'variant')"
         ))),
     }
 }

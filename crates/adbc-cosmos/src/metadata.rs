@@ -52,8 +52,8 @@ pub(crate) fn sample_schema(
             ErrorHelper::internal(driverbase::location!())
                 .message(format!("sampling '{database}/{container}': {e}"))
         })?;
-    // ArrowError → DriverError via `From`.
-    let schema = crate::output::infer_struct_schema(&docs, METADATA_SAMPLE_SIZE)?;
+    // ArrowError → DriverError via `From`. Tolerant of heterogeneous fields (→ Utf8).
+    let schema = crate::inference::infer_schema(&docs, METADATA_SAMPLE_SIZE)?;
     // Don't cache an empty schema from an empty container — it may gain documents later.
     if !docs.is_empty() {
         cache.lock().expect("schema cache poisoned").insert(key, schema.clone());

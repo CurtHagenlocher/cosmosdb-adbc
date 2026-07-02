@@ -190,6 +190,24 @@ def test_struct_inference_knobs(driver: str) -> None:
           fld.get("_ts") == pyarrow.timestamp("s"), str(fld.get("_ts")))
 
 
+def test_heterogeneous_string(driver: str) -> None:
+    print("[native dialect / struct] heterogeneous field -> Utf8 (default build)")
+    t = run_query(
+        driver,
+        {
+            "adbc.cosmos.dialect": "native",
+            "adbc.cosmos.container": "mixed",
+            "adbc.cosmos.output": "struct",
+            "adbc.cosmos.heterogeneous": "string",
+        },
+        "SELECT * FROM c",
+    )
+    fld = {f.name: f.type for f in t.schema}
+    check("type-conflicting 'val' widens to string", fld.get("val") == pyarrow.string(),
+          str(fld.get("val")))
+    check("4 rows returned", t.num_rows == 4, str(t.num_rows))
+
+
 def test_metadata(driver: str) -> None:
     print("[connection metadata] get_table_types / get_table_schema / get_objects")
     db = open_database(driver)
@@ -244,6 +262,7 @@ def main() -> int:
         test_datafusion_join,
         test_datafusion_filter_pushdown,
         test_struct_inference_knobs,
+        test_heterogeneous_string,
         test_metadata,
     ):
         try:
