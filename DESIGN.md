@@ -137,6 +137,29 @@ Three crates, layered so DataFusion/Arrow/ADBC types never leak into transport (
   arbitrary host UDFs. Those stay in DataFusion. Fold the **maximal** pushable subtree per
   container into one Cosmos SQL round-trip (mashup-rs §8, `TopDown`, "fold else recurse"); a join's
   two inputs each fold, the join runs locally.
+  > **⚠️ Empirically corrected (2026-07-01, live emulator + engine v0.5.0).** The list above was the
+  > *aspiration*; the pinned engine and Cosmos itself are much narrower. What we actually measured
+  > (details: `journal/research/cosmosdb/odbc_driver.md` §"Engine surface", and the
+  > `cosmos-pushdown-surface-empirical` memory):
+  > - **Engine `SUPPORTED_FEATURES` (v0.5.0)** = `OffsetAndLimit, OrderBy, MultipleOrderBy, Top,
+  >   NonStreamingOrderBy, Aggregate, HybridSearch`. **`GroupBy`, `Distinct`, `NonValueAggregate`,
+  >   `CompositeAggregate`, `MultipleAggregates` are NOT advertised → gateway rejects them (400).**
+  >   Only a single `SELECT VALUE <agg>` works; `GROUP BY`, `DISTINCT`, projected/multi aggregates
+  >   are unreachable via the engine.
+  > - **Null/undefined semantics diverge from SQL**, so most engine-pushable ops are *not*
+  >   row/order-equivalent to DataFusion: `MIN(c.s)`→`null` (vs SQL `min`="x"), `COUNT(c.s)` counts
+  >   JSON-null, `ORDER BY` places null/undefined first-ASC/last-DESC (opposite DataFusion default),
+  >   and `ORDER BY … LIMIT` returns a *different row set*. Cosmos SQL has no `NULLS FIRST/LAST`.
+  > - **Net:** the only fold that is both engine-supported **and** Exact is `COUNT(*)` →
+  >   `SELECT VALUE COUNT(1) FROM c [WHERE …]`. Everything else (GROUP BY / DISTINCT / general
+  >   aggregates / ORDER BY) stays in DataFusion — the correct, reference-validated path.
+  > - **`AVG` pushdown is safe** where the engine accepts it: cross-partition `AVG` is computed
+  >   count-weighted correctly (verified skewed partitions → true average, not average-of-averages).
+  > - **Multi-column `ORDER BY` should stay local unless a composite index is known to exist** — real
+  >   Cosmos requires a composite index on the sort tuple or the pushed query fails (the emulator is
+  >   lenient and does not enforce this). This mirrors the Microsoft ODBC driver, whose
+  >   `EnableSortPassdownForMultipleColumns` defaults **off** for exactly this reason (while
+  >   `EnablePassdownOfAvgAggrFunction` defaults **on**).
 - **`sql_gen.rs`**: unparse the (optimized) `LogicalPlan` with DataFusion's `Unparser` + a **Cosmos
   SQL `CustomDialect`**, then AST-rewrite the Cosmos-specific bits (`FROM c` aliasing,
   `SELECT VALUE`, property paths, `TOP`/`OFFSET…LIMIT`, Cosmos built-in function names). Never
