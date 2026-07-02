@@ -12,8 +12,10 @@ mod convert;
 mod predicate;
 mod provider;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
+use arrow_schema::SchemaRef;
 use cosmos_client::CosmosClientHandle;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::prelude::SessionContext;
@@ -21,15 +23,22 @@ use datafusion::prelude::SessionContext;
 pub use catalog::CosmosSchemaProvider;
 pub use provider::CosmosTableProvider;
 
+/// A container's inferred Arrow schema, cached by `(database, container)`. Inference samples
+/// documents, so this avoids re-sampling the same container across queries on a connection.
+/// Schemas are a sample-time snapshot; the cache lives for the owner's lifetime (a connection).
+pub type SchemaCache = Mutex<HashMap<(String, String), SchemaRef>>;
+
 /// Register a Cosmos database as the default schema (`datafusion.public`) of `ctx`, so
-/// unqualified table names in SQL resolve to containers in that database.
+/// unqualified table names in SQL resolve to containers in that database. Inferred container
+/// schemas are memoized in `cache` (share one across queries to skip re-sampling).
 pub fn register_cosmos_schema(
     ctx: &SessionContext,
     client: Arc<CosmosClientHandle>,
     database: String,
     sample_size: usize,
+    cache: Arc<SchemaCache>,
 ) -> Result<()> {
-    let provider = Arc::new(CosmosSchemaProvider::new(client, database, sample_size));
+    let provider = Arc::new(CosmosSchemaProvider::new(client, database, sample_size, cache));
     let catalog = ctx
         .catalog("datafusion")
         .ok_or_else(|| DataFusionError::Plan("default catalog 'datafusion' not found".into()))?;

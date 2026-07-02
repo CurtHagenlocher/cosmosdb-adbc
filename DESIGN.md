@@ -389,6 +389,15 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
 
 ## 8. Build status
 
+- **Per-container schema caching — DONE (2026-07-02).** The `datafusion` dialect previously
+  re-sampled a container on every `CosmosSchemaProvider::table()` resolution (and rebuilt the
+  provider per query). Added `cosmos_datafusion::SchemaCache` (`Mutex<HashMap<(db, container),
+  SchemaRef>>`), owned by the `Connection` and threaded Connection → Statement →
+  `register_cosmos_schema` → provider, so inferred schemas are memoized for the connection's
+  lifetime and reused across queries. Unit test (cache hit returns the memoized schema without
+  networking — client points at an unreachable endpoint) + live test (two queries on one
+  connection: populate then reuse). Metadata (`get_table_schema`/`get_objects`) still re-samples —
+  a candidate to share this cache later.
 - **Schema-inference knobs (§3.5) — first cut DONE, live-verified (2026-07-01).** `inference.rs`
   drives `struct`-mode inference from `InferenceOptions`: base arrow-json inference, then top-level
   type transforms — `number_inference=decimal` (fractional fields → `Decimal128(p,s)`; integers stay

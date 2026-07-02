@@ -62,6 +62,8 @@ pub struct CosmosStatement {
     infer_temporal: bool,
     epoch_fields: HashMap<String, TimeUnit>,
     heterogeneous: HeterogeneousMode,
+    /// Shared container-schema cache for the `datafusion` dialect (owned by the connection).
+    schema_cache: Arc<cosmos_datafusion::SchemaCache>,
     query: Option<String>,
 }
 
@@ -70,11 +72,13 @@ impl CosmosStatement {
         runtime: Arc<Runtime>,
         client: Arc<CosmosClientHandle>,
         database: Option<String>,
+        schema_cache: Arc<cosmos_datafusion::SchemaCache>,
     ) -> Self {
         Self {
             runtime,
             client,
             database,
+            schema_cache,
             container: None,
             dialect: Dialect::default(),
             output: OutputMode::default(),
@@ -271,13 +275,14 @@ impl Statement for CosmosStatement {
                 })?;
                 let sample = self.sample_size.unwrap_or(1000).max(1) as usize;
                 let client = self.client.clone();
+                let cache = self.schema_cache.clone();
                 let sql = query.to_string();
 
                 let (schema, batches) = self.runtime.block_on(async move {
                     use datafusion::prelude::SessionContext;
 
                     let ctx = SessionContext::new();
-                    cosmos_datafusion::register_cosmos_schema(&ctx, client, database, sample)
+                    cosmos_datafusion::register_cosmos_schema(&ctx, client, database, sample, cache)
                         .map_err(|e| df_error("register schema", e))?;
                     let df = ctx.sql(&sql).await.map_err(|e| df_error("plan sql", e))?;
                     let schema: arrow_schema::SchemaRef =

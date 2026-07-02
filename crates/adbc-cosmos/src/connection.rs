@@ -27,6 +27,9 @@ pub struct CosmosConnection {
     client: Arc<CosmosClientHandle>,
     /// The database (ADBC catalog) this connection is scoped to.
     current_database: Option<String>,
+    /// Container schemas inferred by the `datafusion` dialect, memoized for the connection's
+    /// lifetime so repeated queries don't re-sample the same containers.
+    schema_cache: Arc<cosmos_datafusion::SchemaCache>,
 }
 
 impl CosmosConnection {
@@ -41,6 +44,7 @@ impl CosmosConnection {
             runtime,
             client,
             current_database,
+            schema_cache: Arc::new(cosmos_datafusion::SchemaCache::default()),
         }
     }
 }
@@ -53,6 +57,7 @@ impl Connection for CosmosConnection {
             self.runtime.clone(),
             self.client.clone(),
             self.current_database.clone(),
+            self.schema_cache.clone(),
         ))
     }
 

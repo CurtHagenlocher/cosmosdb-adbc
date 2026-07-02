@@ -225,6 +225,31 @@ fn open_connection() -> impl Connection {
 
 #[test]
 #[ignore = "requires the local Cosmos emulator (run cosmos-client's seed example first)"]
+fn datafusion_dialect_reuses_cached_schema() {
+    // Two datafusion-dialect queries on the SAME connection: the first populates the
+    // per-connection schema cache, the second should reuse it. Both must return correctly.
+    fn run_df<C: Connection>(conn: &mut C, sql: &str) -> usize {
+        let mut stmt = conn.new_statement().expect("new_statement");
+        stmt.set_option(
+            OptionStatement::Other("adbc.cosmos.dialect".into()),
+            OptionValue::String("datafusion".into()),
+        )
+        .expect("set dialect");
+        stmt.set_sql_query(sql).expect("set query");
+        let reader = stmt.execute().expect("execute");
+        reader.map(|b| b.expect("batch").num_rows()).sum()
+    }
+
+    let mut conn = open_connection();
+    let sql = r#"SELECT id, "mergeOrder" FROM items WHERE "mergeOrder" > 40"#;
+    let first = run_df(&mut conn, sql);
+    let second = run_df(&mut conn, sql);
+    assert_eq!(first, 10, "mergeOrder > 40 selects 10 rows");
+    assert_eq!(second, first, "cached-schema run must match the first");
+}
+
+#[test]
+#[ignore = "requires the local Cosmos emulator (run cosmos-client's seed example first)"]
 fn struct_inference_knobs_decimal_and_epoch() {
     use arrow_schema::{DataType, TimeUnit};
 
