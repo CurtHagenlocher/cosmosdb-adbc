@@ -225,6 +225,58 @@ fn open_connection() -> impl Connection {
 
 #[test]
 #[ignore = "requires the local Cosmos emulator (run cosmos-client's seed example first)"]
+fn struct_inference_knobs_decimal_and_epoch() {
+    use arrow_schema::{DataType, TimeUnit};
+
+    let mut driver = CosmosDriver::default();
+    let db = driver
+        .new_database_with_opts([
+            (
+                OptionDatabase::Uri,
+                OptionValue::String("https://localhost:8081/".into()),
+            ),
+            other("adbc.cosmos.auth", "key"),
+            other("adbc.cosmos.account_key", EMULATOR_KEY),
+            other("adbc.cosmos.database", "spikedb"),
+        ])
+        .expect("new_database");
+    let mut conn = db.new_connection().expect("new_connection");
+    let mut stmt = conn.new_statement().expect("new_statement");
+
+    for (k, v) in [
+        ("adbc.cosmos.container", "items"),
+        ("adbc.cosmos.output", "struct"),
+        ("adbc.cosmos.number_inference", "decimal"),
+        ("adbc.cosmos.decimal", "20,4"),
+        ("adbc.cosmos.epoch_fields", "_ts:s"),
+    ] {
+        stmt.set_option(OptionStatement::Other(k.into()), OptionValue::String(v.into()))
+            .expect("set option");
+    }
+    stmt.set_sql_query("SELECT * FROM c").expect("set query");
+
+    let reader = stmt.execute().expect("execute");
+    let schema = reader.schema();
+    // `value` is a JSON float → Decimal128(20,4); `mergeOrder` is integral → stays Int64;
+    // `_ts` (Cosmos epoch seconds) → Timestamp(Second).
+    assert_eq!(
+        schema.field_with_name("value").unwrap().data_type(),
+        &DataType::Decimal128(20, 4)
+    );
+    assert_eq!(
+        schema.field_with_name("mergeOrder").unwrap().data_type(),
+        &DataType::Int64
+    );
+    assert_eq!(
+        schema.field_with_name("_ts").unwrap().data_type(),
+        &DataType::Timestamp(TimeUnit::Second, None)
+    );
+    let rows: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
+    assert_eq!(rows, 50);
+}
+
+#[test]
+#[ignore = "requires the local Cosmos emulator (run cosmos-client's seed example first)"]
 fn metadata_get_table_types_lists_table() {
     let conn = open_connection();
     let reader = conn.get_table_types().expect("get_table_types");

@@ -167,6 +167,29 @@ def test_datafusion_filter_pushdown(driver: str) -> None:
     check("every row satisfies mergeOrder > 25", all_gt, "a row leaked past the filter")
 
 
+def test_struct_inference_knobs(driver: str) -> None:
+    print("[native dialect / struct] inference knobs: decimal + epoch (§3.5)")
+    t = run_query(
+        driver,
+        {
+            "adbc.cosmos.dialect": "native",
+            "adbc.cosmos.container": "items",
+            "adbc.cosmos.output": "struct",
+            "adbc.cosmos.number_inference": "decimal",
+            "adbc.cosmos.decimal": "20,4",
+            "adbc.cosmos.epoch_fields": "_ts:s",
+        },
+        "SELECT * FROM c",
+    )
+    fld = {f.name: f.type for f in t.schema}
+    check("float field -> decimal128(20,4) survives FFI",
+          fld.get("value") == pyarrow.decimal128(20, 4), str(fld.get("value")))
+    check("integral field stays int64",
+          fld.get("mergeOrder") == pyarrow.int64(), str(fld.get("mergeOrder")))
+    check("epoch field -> timestamp[s]",
+          fld.get("_ts") == pyarrow.timestamp("s"), str(fld.get("_ts")))
+
+
 def test_metadata(driver: str) -> None:
     print("[connection metadata] get_table_types / get_table_schema / get_objects")
     db = open_database(driver)
@@ -220,6 +243,7 @@ def main() -> int:
         test_native_struct,
         test_datafusion_join,
         test_datafusion_filter_pushdown,
+        test_struct_inference_knobs,
         test_metadata,
     ):
         try:

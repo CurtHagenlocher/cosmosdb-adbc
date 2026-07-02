@@ -199,7 +199,7 @@ Three crates, layered so DataFusion/Arrow/ADBC types never leak into transport (
 | `adbc.cosmos.sample_size` | Statement/Connection | int (e.g. 1000) | docs to sample for `struct` inference |
 | `adbc.cosmos.number_inference` | Statement | `float64` (default) \| `decimal` | numeric fidelity (see §3.5) — applied uniformly |
 | `adbc.cosmos.decimal` | Statement | `p,s` (e.g. `38,9`) | precision,scale when `number_inference=decimal` |
-| `adbc.cosmos.heterogeneous` | Statement | `variant` (default) \| `string` | fallback for type-conflicting fields (`struct` output) |
+| `adbc.cosmos.heterogeneous` | Statement | `string` (default) | fallback for type-conflicting fields (`struct`); `variant` reserved (feature-gated, not yet impl) |
 | `adbc.cosmos.infer_temporal` | Statement | `off` (default) \| `on` | infer `Date`/`Timestamp` from ISO-8601 strings (`struct`) |
 | `adbc.cosmos.epoch_fields` | Statement | comma list | fields to read as epoch timestamps; `name:s`/`name:ms` |
 | `adbc.cosmos.max_retries` | Connection | int | 429 throttling retries |
@@ -239,9 +239,14 @@ and beats it on structure.
    the decimal typing applies to `struct` columns today; `variant` numbers stay `Double` until the
    library supports decimal encoding (a library limitation we document, not a designed asymmetry —
    revisit when upstream lands it, or hand-roll only if a user needs it sooner).
-2. **Heterogeneous / type-conflicting fields (`heterogeneous`).** Default `variant` (self-describing,
-   lossless) rather than the ODBC driver's widen-to-`String`; opt-in `string` for maximum
-   consumer compatibility. (JSON-string fallback for the whole doc remains the ultimate backstop.)
+2. **Heterogeneous / type-conflicting fields (`heterogeneous`).** These would otherwise
+   *decode-crash* (arrow-json infers a conflicting field as `Utf8`, but its `Decoder` then rejects
+   the non-string values — so this is a robustness fix, not just a nicety). **Implemented: widen
+   to `Utf8`, stringifying non-string values** (universally consumable). `variant` (per-field, self-
+   describing) was the intended default, but Variant is behind the opt-in `variant` cargo feature
+   and can't produce a column in a stock build — so **`string` is the effective default**;
+   per-field `variant` is a **feature-gated follow-up**. Conflict detection is top-level only
+   (nested conflicts can still decode-crash — a known limitation to revisit).
 3. **Dates/datetimes from strings (`infer_temporal`, default `off`).** ISO-8601 string → `Date32`/
    `Timestamp` is pattern-guessing and can misfire on a field that merely looks date-like; the ODBC
    driver doesn't do it, so we default off and make it explicit opt-in.
@@ -384,6 +389,16 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
 
 ## 8. Build status
 
+- **Schema-inference knobs (§3.5) — first cut DONE, live-verified (2026-07-01).** `inference.rs`
+  drives `struct`-mode inference from `InferenceOptions`: base arrow-json inference, then top-level
+  type transforms — `number_inference=decimal` (fractional fields → `Decimal128(p,s)`; integers stay
+  `Int64`), `infer_temporal=on` (ISO-8601 strings → `Date32`/`Timestamp`), `epoch_fields=name:s|ms`
+  (integers → `Timestamp(unit)`), and heterogeneous fields → `Utf8` (stringified — fixes a real
+  decode-crash). arrow-json's `Decoder` does the coercion (verified). Option keys parsed in
+  `statement.rs`. Connectionless unit tests + a live test (`value`→`Decimal128(20,4)`,
+  `mergeOrder`→`Int64`, `_ts`→`Timestamp(s)`); `validation/roundtrip.py` (now 18/18) confirms
+  `Decimal128`/`Timestamp` survive the C ABI into pyarrow. Follow-ups: per-field `variant`
+  (feature-gated), recursive (nested) transforms.
 - **Connection metadata — DONE, live-verified (2026-07-01).** `metadata.rs`: `get_objects`
   (via `driverbase::get_objects` — catalog = Cosmos database, single empty schema, table =
   container, columns inferred by sampling per §3.5), `get_table_schema` (samples + infers a

@@ -4,18 +4,20 @@
 //! representation (`json` | `variant` | `struct`). Phase 0 parses/stores these and the
 //! SQL text; `execute` is wired up in Phase 1 once the `cosmos-client` transport exists.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use adbc_core::error::Result;
 use adbc_core::options::{OptionStatement, OptionValue};
 use adbc_core::{Optionable, PartitionedResult, Statement};
 use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::Schema;
+use arrow_schema::{Schema, TimeUnit};
 use cosmos_client::CosmosClientHandle;
 use driverbase::error::ErrorHelper as _;
 
 use crate::batch_reader::{SingleBatchReader, VecBatchReader};
 use crate::error::ErrorHelper;
+use crate::inference::{HeterogeneousMode, InferenceOptions, NumberMode};
 use crate::options;
 use crate::output;
 use crate::runtime::Runtime;
@@ -53,6 +55,13 @@ pub struct CosmosStatement {
     dialect: Dialect,
     output: OutputMode,
     sample_size: Option<i64>,
+    // struct-mode inference knobs (DESIGN §3.5); see `inference_options`.
+    number_decimal: bool,
+    decimal_precision: u8,
+    decimal_scale: i8,
+    infer_temporal: bool,
+    epoch_fields: HashMap<String, TimeUnit>,
+    heterogeneous: HeterogeneousMode,
     query: Option<String>,
 }
 
@@ -70,7 +79,30 @@ impl CosmosStatement {
             dialect: Dialect::default(),
             output: OutputMode::default(),
             sample_size: None,
+            number_decimal: false,
+            decimal_precision: 38,
+            decimal_scale: 9,
+            infer_temporal: false,
+            epoch_fields: HashMap::new(),
+            heterogeneous: HeterogeneousMode::default(),
             query: None,
+        }
+    }
+
+    /// Assemble the §3.5 inference options from the parsed statement knobs.
+    fn inference_options(&self) -> InferenceOptions {
+        InferenceOptions {
+            number: if self.number_decimal {
+                NumberMode::Decimal {
+                    precision: self.decimal_precision,
+                    scale: self.decimal_scale,
+                }
+            } else {
+                NumberMode::Float64
+            },
+            infer_temporal: self.infer_temporal,
+            epoch_fields: self.epoch_fields.clone(),
+            heterogeneous: self.heterogeneous,
         }
     }
 }
@@ -105,6 +137,83 @@ fn parse_output(value: &str) -> Result<OutputMode> {
             ))
             .to_adbc()),
     }
+}
+
+fn opt_err(msg: std::fmt::Arguments) -> adbc_core::error::Error {
+    ErrorHelper::internal("set_option").format(msg).to_adbc()
+}
+
+/// `float64` → false, `decimal` → true.
+fn parse_number_inference(value: &str) -> Result<bool> {
+    match value {
+        "float64" => Ok(false),
+        "decimal" => Ok(true),
+        other => Err(opt_err(format_args!(
+            "invalid number_inference '{other}' (expected 'float64' or 'decimal')"
+        ))),
+    }
+}
+
+/// `precision,scale` (e.g. `38,9`); precision 1..=38, scale 0..=precision.
+fn parse_decimal(value: &str) -> Result<(u8, i8)> {
+    let (p, s) = value.split_once(',').ok_or_else(|| {
+        opt_err(format_args!("invalid decimal '{value}' (expected 'precision,scale')"))
+    })?;
+    let precision: u8 = p
+        .trim()
+        .parse()
+        .map_err(|_| opt_err(format_args!("invalid decimal precision '{p}'")))?;
+    let scale: i8 = s
+        .trim()
+        .parse()
+        .map_err(|_| opt_err(format_args!("invalid decimal scale '{s}'")))?;
+    if !(1..=38).contains(&precision) || scale < 0 || scale as u8 > precision {
+        return Err(opt_err(format_args!(
+            "decimal precision/scale out of range: precision 1..=38, 0 <= scale <= precision"
+        )));
+    }
+    Ok((precision, scale))
+}
+
+fn parse_heterogeneous(value: &str) -> Result<HeterogeneousMode> {
+    match value {
+        "string" => Ok(HeterogeneousMode::String),
+        "variant" => Err(opt_err(format_args!(
+            "heterogeneous='variant' is not implemented yet; use 'string'"
+        ))),
+        other => Err(opt_err(format_args!(
+            "invalid heterogeneous '{other}' (expected 'string')"
+        ))),
+    }
+}
+
+fn parse_bool_onoff(key: &str, value: &str) -> Result<bool> {
+    match value {
+        "on" | "true" => Ok(true),
+        "off" | "false" => Ok(false),
+        other => Err(opt_err(format_args!("invalid {key} '{other}' (expected 'on' or 'off')"))),
+    }
+}
+
+/// Parse `name:s,other:ms` into field → epoch unit.
+fn parse_epoch_fields(value: &str) -> Result<HashMap<String, TimeUnit>> {
+    let mut map = HashMap::new();
+    for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let (name, unit) = entry.split_once(':').ok_or_else(|| {
+            opt_err(format_args!("invalid epoch field '{entry}' (expected 'name:s' or 'name:ms')"))
+        })?;
+        let unit = match unit.trim() {
+            "s" => TimeUnit::Second,
+            "ms" => TimeUnit::Millisecond,
+            other => {
+                return Err(opt_err(format_args!(
+                    "invalid epoch unit '{other}' for '{name}' (expected 's' or 'ms')"
+                )));
+            }
+        };
+        map.insert(name.trim().to_string(), unit);
+    }
+    Ok(map)
 }
 
 impl Statement for CosmosStatement {
@@ -148,7 +257,7 @@ impl Statement for CosmosStatement {
                     OutputMode::Struct => {
                         // Default sample size mirrors a "read the first page" heuristic.
                         let sample = self.sample_size.unwrap_or(1000).max(1) as usize;
-                        output::build_struct_batch(&docs, sample)?
+                        crate::inference::build_struct_batch(&docs, sample, &self.inference_options())?
                     }
                     OutputMode::Variant => output::build_variant_batch(&docs)?,
                 };
@@ -247,6 +356,33 @@ impl Optionable for CosmosStatement {
                 }
                 options::SAMPLE_SIZE => {
                     self.sample_size = Some(options::require_int(options::SAMPLE_SIZE, value)?);
+                }
+                options::NUMBER_INFERENCE => {
+                    self.number_decimal = parse_number_inference(&options::require_string(
+                        options::NUMBER_INFERENCE,
+                        value,
+                    )?)?;
+                }
+                options::DECIMAL => {
+                    let (p, s) = parse_decimal(&options::require_string(options::DECIMAL, value)?)?;
+                    self.decimal_precision = p;
+                    self.decimal_scale = s;
+                }
+                options::INFER_TEMPORAL => {
+                    self.infer_temporal = parse_bool_onoff(
+                        options::INFER_TEMPORAL,
+                        &options::require_string(options::INFER_TEMPORAL, value)?,
+                    )?;
+                }
+                options::EPOCH_FIELDS => {
+                    self.epoch_fields =
+                        parse_epoch_fields(&options::require_string(options::EPOCH_FIELDS, value)?)?;
+                }
+                options::HETEROGENEOUS => {
+                    self.heterogeneous = parse_heterogeneous(&options::require_string(
+                        options::HETEROGENEOUS,
+                        value,
+                    )?)?;
                 }
                 _ => return Err(ErrorHelper::set_unknown_option(&key).to_adbc()),
             },

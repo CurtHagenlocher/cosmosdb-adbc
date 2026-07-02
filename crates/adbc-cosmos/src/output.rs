@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use adbc_core::error::Result;
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use arrow_json::reader::{ReaderBuilder, infer_json_schema_from_iterator};
+use arrow_json::reader::infer_json_schema_from_iterator;
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use driverbase::error::ErrorHelper as _;
 use serde_json::Value;
@@ -19,6 +19,7 @@ use serde_json::Value;
 use crate::error::ErrorHelper;
 
 /// Map an Arrow error into an ADBC error with a bit of context.
+#[cfg(feature = "variant")]
 fn arrow_err(context: &'static str, e: ArrowError) -> adbc_core::error::Error {
     ErrorHelper::internal(context)
         .message(e.to_string())
@@ -67,27 +68,6 @@ pub fn infer_struct_schema(
     let schema =
         infer_json_schema_from_iterator(docs.iter().take(sample_n).map(Ok::<_, ArrowError>))?;
     Ok(Arc::new(schema))
-}
-
-pub fn build_struct_batch(docs: &[Value], sample_size: usize) -> Result<RecordBatch> {
-    if docs.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
-    }
-
-    let schema =
-        infer_struct_schema(docs, sample_size).map_err(|e| arrow_err("infer_json_schema", e))?;
-
-    let mut decoder = ReaderBuilder::new(schema.clone())
-        .build_decoder()
-        .map_err(|e| arrow_err("build_decoder", e))?;
-    decoder
-        .serialize(docs)
-        .map_err(|e| arrow_err("decode_documents", e))?;
-
-    match decoder.flush().map_err(|e| arrow_err("flush", e))? {
-        Some(batch) => Ok(batch),
-        None => Ok(RecordBatch::new_empty(schema)),
-    }
 }
 
 /// Build a single-column Arrow **Variant** batch from documents (variant output mode).

@@ -30,6 +30,16 @@ pub const CONTAINER: &str = "adbc.cosmos.container";
 pub const OUTPUT: &str = "adbc.cosmos.output";
 /// Number of documents to sample for `struct`-mode schema inference.
 pub const SAMPLE_SIZE: &str = "adbc.cosmos.sample_size";
+/// Numeric fidelity for `struct` inference: `float64` (default) | `decimal` (§3.5).
+pub const NUMBER_INFERENCE: &str = "adbc.cosmos.number_inference";
+/// `precision,scale` (e.g. `38,9`) used when `number_inference=decimal`.
+pub const DECIMAL: &str = "adbc.cosmos.decimal";
+/// Fallback for type-conflicting `struct` fields: `string` (currently the only mode).
+pub const HETEROGENEOUS: &str = "adbc.cosmos.heterogeneous";
+/// Infer `Date`/`Timestamp` from ISO-8601 strings in `struct` mode: `off` (default) | `on`.
+pub const INFER_TEMPORAL: &str = "adbc.cosmos.infer_temporal";
+/// Comma list of fields to read as epoch timestamps, each `name:s` or `name:ms`.
+pub const EPOCH_FIELDS: &str = "adbc.cosmos.epoch_fields";
 
 /// Extract a string option value, or error if the caller passed a non-string.
 pub(crate) fn require_string(key: &str, value: OptionValue) -> Result<String> {
