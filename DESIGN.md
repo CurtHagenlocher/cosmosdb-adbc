@@ -169,6 +169,21 @@ Three crates, layered so DataFusion/Arrow/ADBC types never leak into transport (
   >   not proven equivalent to ANSI `avg` (which ignores nulls), so this is opt-in. The ODBC driver
   >   defaults its AVG flag on because it always has a correct local fallback; we would actually
   >   push, so we default off, consistent with the conservative-pushdown contract.
+  >
+  > **`ORDER BY` pushdown** (same rule; substitutes a sort-carrying scan for a `Sort` over a Cosmos
+  > `TableScan`, then drops the local `Sort`). Two correctness gates keep it order-equivalent:
+  > - *Null placement.* Cosmos orders null/undefined as the **smallest** value (first ASC, last DESC);
+  >   DataFusion defaults to nulls-largest (`nulls_max`). A key is pushed only when its placement is
+  >   nulls-smallest — `nulls_first == asc` (SQL `NULLS FIRST` on ASC / `NULLS LAST` on DESC). A plain
+  >   `ORDER BY x` therefore stays local, correctly.
+  > - *Type.* Only numeric keys (`Int64`/`Float64`) are pushed; string collation and the
+  >   stringified-heterogeneous representation aren't proven to match Cosmos's type-ordered sort.
+  >
+  > `adbc.cosmos.pushdown.sort` (default **on**) governs single-column sort — Cosmos auto-indexes
+  > every scalar path, so it needs no extra index. `adbc.cosmos.pushdown.multi_sort` (default **off**,
+  > the `EnableSortPassdownForMultipleColumns` analog) additionally allows multi-column `ORDER BY`,
+  > which needs a Cosmos composite index on the sort tuple or the pushed query fails at runtime (the
+  > emulator does not enforce this). An `ORDER BY … LIMIT` top-N pushes as `ORDER BY … OFFSET 0 LIMIT n`.
   > - **Multi-column `ORDER BY` should stay local unless a composite index is known to exist** — real
   >   Cosmos requires a composite index on the sort tuple or the pushed query fails (the emulator is
   >   lenient and does not enforce this). This mirrors the Microsoft ODBC driver, whose
@@ -219,6 +234,8 @@ Three crates, layered so DataFusion/Arrow/ADBC types never leak into transport (
 | `adbc.cosmos.epoch_fields` | Statement | comma list | fields to read as epoch timestamps; `name:s`/`name:ms` |
 | `adbc.cosmos.pushdown.count` | Statement | `on` (default) \| `off` | `datafusion` dialect: fold whole-container `COUNT(*)` → `SELECT VALUE COUNT(1)` (§3.2) |
 | `adbc.cosmos.pushdown.avg` | Statement | `off` (default) \| `on` | `datafusion` dialect: fold `AVG(col)` → `SELECT VALUE AVG(col)`; opt-in (null-semantics caveat, §3.2) |
+| `adbc.cosmos.pushdown.sort` | Statement | `on` (default) \| `off` | `datafusion` dialect: push a single-column numeric `ORDER BY` into the engine (nulls-smallest keys only, §3.2) |
+| `adbc.cosmos.pushdown.multi_sort` | Statement | `off` (default) \| `on` | `datafusion` dialect: also push multi-column `ORDER BY`; needs a Cosmos composite index (ODBC `EnableSortPassdownForMultipleColumns` analog, §3.2) |
 | `adbc.cosmos.max_retries` | Connection | int | 429 throttling retries |
 
 ### 3.5 Schema inference & type mapping

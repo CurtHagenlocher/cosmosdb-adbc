@@ -263,6 +263,72 @@ fn datafusion_dialect_folds_count_and_avg() {
     assert!((avg - 25.5).abs() < 1e-9, "AVG(mergeOrder) should be 25.5, got {avg}");
 }
 
+#[test]
+#[ignore = "requires the local Cosmos emulator (run cosmos-client's seed example first)"]
+fn datafusion_dialect_pushes_order_by() {
+    use arrow_array::Int64Array;
+
+    // `mergeOrder` is 1..=50. Push a nulls-smallest numeric ORDER BY (ASC NULLS FIRST) with a
+    // top-N into the engine and confirm both the row set and the order are correct.
+    fn merge_orders<C: Connection>(conn: &mut C, sql: &str, multi: bool) -> Vec<i64> {
+        let mut stmt = conn.new_statement().expect("new_statement");
+        stmt.set_option(
+            OptionStatement::Other("adbc.cosmos.dialect".into()),
+            OptionValue::String("datafusion".into()),
+        )
+        .expect("set dialect");
+        if multi {
+            stmt.set_option(
+                OptionStatement::Other("adbc.cosmos.pushdown.multi_sort".into()),
+                OptionValue::String("on".into()),
+            )
+            .expect("set multi_sort=on");
+        }
+        stmt.set_sql_query(sql).expect("set query");
+        let mut out = Vec::new();
+        for batch in stmt.execute().expect("execute") {
+            let batch = batch.expect("batch");
+            let idx = batch.schema().index_of("mergeOrder").expect("mergeOrder column");
+            let col = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("mergeOrder is Int64");
+            for r in 0..col.len() {
+                out.push(col.value(r));
+            }
+        }
+        out
+    }
+
+    let mut conn = open_connection();
+
+    // Ascending top-5 → 1,2,3,4,5 in order (pushed as ORDER BY … ASC OFFSET 0 LIMIT 5).
+    let asc = merge_orders(
+        &mut conn,
+        r#"SELECT "mergeOrder" FROM items ORDER BY "mergeOrder" ASC NULLS FIRST LIMIT 5"#,
+        false,
+    );
+    assert_eq!(asc, vec![1, 2, 3, 4, 5], "ascending pushed sort must be ordered");
+
+    // Descending top-5 → 50,49,48,47,46.
+    let desc = merge_orders(
+        &mut conn,
+        r#"SELECT "mergeOrder" FROM items ORDER BY "mergeOrder" DESC NULLS LAST LIMIT 5"#,
+        false,
+    );
+    assert_eq!(desc, vec![50, 49, 48, 47, 46], "descending pushed sort must be ordered");
+
+    // Full ascending sort must return all 50 rows, strictly increasing.
+    let all = merge_orders(
+        &mut conn,
+        r#"SELECT "mergeOrder" FROM items ORDER BY "mergeOrder" ASC NULLS FIRST"#,
+        false,
+    );
+    assert_eq!(all.len(), 50);
+    assert!(all.windows(2).all(|w| w[0] < w[1]), "full sort must be strictly increasing");
+}
+
 /// Open a connection to the seeded emulator database.
 fn open_connection() -> impl Connection {
     let mut driver = CosmosDriver::default();

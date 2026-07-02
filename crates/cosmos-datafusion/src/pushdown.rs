@@ -1,14 +1,14 @@
-//! Aggregate pushdown: fold a whole-container `COUNT(*)` / `AVG(col)` (no `GROUP BY`) into a
-//! single `SELECT VALUE …` Cosmos round-trip instead of streaming every document into a local
-//! DataFusion aggregate.
-//!
-//! Scope is deliberately tiny and mirrors what the engine executes as a single VALUE aggregate
-//! (measured live against the emulator — see the `cosmos-pushdown-surface-empirical` note):
-//! exactly one aggregate, no `GROUP BY` / `DISTINCT`, over a bare Cosmos `TableScan` (any WHERE
-//! we already push, no `LIMIT`). Anything else stays in DataFusion, which is the correct,
+//! Cosmos pushdown: fold work the engine can do server-side out of the local DataFusion plan.
+//! Two independent folds, each over a bare Cosmos `TableScan` (any WHERE we already push):
+//! whole-container single aggregates (`COUNT(*)` / `AVG`) into one `SELECT VALUE …`, and
+//! `ORDER BY` into an engine-side sort. Anything else stays in DataFusion — the correct,
 //! reference-validated path.
 //!
-//! ## Correctness & the two toggles ([`PushdownConfig`])
+//! Scope mirrors what the engine executes (measured live against the emulator — see the
+//! `cosmos-pushdown-surface-empirical` note): a single VALUE aggregate (no `GROUP BY` /
+//! `DISTINCT`), or `ORDER BY` (`OrderBy` / `MultipleOrderBy` features).
+//!
+//! ## Correctness & the toggles ([`PushdownConfig`])
 //!
 //! - **`COUNT(*)` → `SELECT VALUE COUNT(1)`** (default **on**). Row-equivalent to DataFusion's
 //!   `count(*)`: both count documents/rows regardless of nulls. Only `COUNT(*)` / `COUNT(<lit>)`
@@ -18,6 +18,16 @@
 //!   count-weighted correctly by the engine, but Cosmos null/non-numeric aggregate semantics are
 //!   *not* proven equivalent to DataFusion's (which ignore nulls), so pushing it can diverge when
 //!   the column holds JSON null / non-numeric values. Opt-in only.
+//! - **`ORDER BY col …` → engine-side sort** (single-column default **on**, multi-column default
+//!   **off**). Two correctness gates make it row/order-equivalent:
+//!   1. *Null placement.* Cosmos orders null/undefined as the **smallest** value (first ASC, last
+//!      DESC); DataFusion defaults to nulls-largest. So a key is only pushed when its placement is
+//!      nulls-smallest, i.e. `nulls_first == asc` (what SQL `NULLS FIRST` on ASC / `NULLS LAST` on
+//!      DESC produce). A default `ORDER BY x` therefore stays local — correctly.
+//!   2. *Type.* Only numeric keys (`Int64` / `Float64`) are pushed; string collation and the
+//!      stringified-heterogeneous representation are not proven to match Cosmos's type-ordered sort.
+//!
+//!   Multi-column additionally needs a composite index in production, hence the opt-in.
 //!
 //! This mirrors the Microsoft ODBC driver's two passdown knobs
 //! (`EnablePassdownOfAvgAggrFunction`, `EnableSortPassdownForMultipleColumns`): performance/RU
@@ -29,7 +39,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use cosmos_client::CosmosClientHandle;
 use datafusion::catalog::{Session, TableProvider};
@@ -37,21 +47,28 @@ use datafusion::common::tree_node::Transformed;
 use datafusion::datasource::{provider_as_source, source_as_provider};
 use datafusion::error::Result;
 use datafusion::logical_expr::builder::LogicalPlanBuilder;
-use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan, TableScan, TableType};
+use datafusion::logical_expr::{Aggregate, Expr, LogicalPlan, Sort, TableScan, TableType};
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::col;
 
 use crate::predicate;
-use crate::provider::{CosmosExec, CosmosTableProvider};
+use crate::provider::{CosmosExec, CosmosTableProvider, OrderBy};
 
-/// Which single-aggregate folds the DataFusion dialect performs. See the module docs.
+/// Which folds the DataFusion dialect performs. See the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PushdownConfig {
     /// Fold `COUNT(*)` into `SELECT VALUE COUNT(1)`. Provably row-equivalent; on by default.
     pub count: bool,
     /// Fold `AVG(col)` into `SELECT VALUE AVG(col)`. Off by default (null-semantics caveat).
     pub avg: bool,
+    /// Push a single-column `ORDER BY` into the engine. On by default (Cosmos auto-indexes every
+    /// scalar path, so a single-property sort needs no extra index).
+    pub sort: bool,
+    /// Also push a **multi**-column `ORDER BY`. Off by default — production Cosmos requires a
+    /// composite index on the sort tuple or the query fails at runtime (the emulator is lenient).
+    /// The direct analog of the ODBC driver's `EnableSortPassdownForMultipleColumns`.
+    pub multi_sort: bool,
 }
 
 impl Default for PushdownConfig {
@@ -59,24 +76,26 @@ impl Default for PushdownConfig {
         Self {
             count: true,
             avg: false,
+            sort: true,
+            multi_sort: false,
         }
     }
 }
 
-/// Optimizer rule that folds a bare single-aggregate over a Cosmos container into one
-/// `SELECT VALUE …` scan.
+/// Optimizer rule that folds a bare aggregate or an `ORDER BY` over a Cosmos container into the
+/// engine-executed scan.
 #[derive(Debug)]
-pub(crate) struct AggregatePushdown {
+pub(crate) struct CosmosPushdown {
     config: PushdownConfig,
 }
 
-impl AggregatePushdown {
+impl CosmosPushdown {
     pub(crate) fn new(config: PushdownConfig) -> Self {
         Self { config }
     }
 
     /// Attempt to fold `agg`; `Ok(None)` leaves the aggregate for local execution.
-    fn try_fold(&self, agg: &Aggregate) -> Result<Option<LogicalPlan>> {
+    fn try_fold_aggregate(&self, agg: &Aggregate) -> Result<Option<LogicalPlan>> {
         // A single bare aggregate, no GROUP BY. Multi-aggregate / grouped queries are rejected
         // by the engine and stay local.
         if !agg.group_expr.is_empty() || agg.aggr_expr.len() != 1 {
@@ -173,6 +192,75 @@ impl AggregatePushdown {
             _ => None,
         }
     }
+
+    /// Attempt to push `sort` into the engine; `Ok(None)` leaves it for a local sort.
+    fn try_fold_sort(&self, sort: &Sort) -> Result<Option<LogicalPlan>> {
+        if !self.config.sort || sort.expr.is_empty() {
+            return Ok(None);
+        }
+        // Multi-column ORDER BY needs a composite index in production (opt-in).
+        if sort.expr.len() > 1 && !self.config.multi_sort {
+            return Ok(None);
+        }
+        // The input must be a bare Cosmos TableScan with no LIMIT beneath the sort (a LIMIT there
+        // would mean limit-then-sort, which `ORDER BY … LIMIT` does not reproduce).
+        let LogicalPlan::TableScan(scan) = sort.input.as_ref() else {
+            return Ok(None);
+        };
+        if scan.fetch.is_some() {
+            return Ok(None);
+        }
+        // Keep the provider Arc alive for the borrow of the downcast reference below.
+        let Ok(provider_arc) = source_as_provider(&scan.source) else {
+            return Ok(None);
+        };
+        let Some(cosmos) = provider_arc.as_any().downcast_ref::<CosmosTableProvider>() else {
+            return Ok(None);
+        };
+        let schema = cosmos.schema();
+
+        // Build the ORDER BY clause, gating each key on Cosmos-equivalent ordering.
+        let mut keys = Vec::with_capacity(sort.expr.len());
+        for s in &sort.expr {
+            // Cosmos orders null/undefined as the smallest value → first ASC, last DESC. Only push
+            // when DataFusion's placement matches (nulls_first == asc); otherwise sort locally.
+            if s.nulls_first != s.asc {
+                return Ok(None);
+            }
+            let Some(name) = sort_column(&s.expr) else {
+                return Ok(None);
+            };
+            // Only numeric columns share an identical total order with Cosmos.
+            let Ok(field) = schema.field_with_name(name) else {
+                return Ok(None);
+            };
+            if !matches!(field.data_type(), DataType::Int64 | DataType::Float64) {
+                return Ok(None);
+            }
+            let dir = if s.asc { "ASC" } else { "DESC" };
+            keys.push(format!("{} {dir}", predicate::cosmos_property(name)));
+        }
+
+        // Substitute a provider that appends the ORDER BY (+ any top-N), reusing the original
+        // scan's table name / projection / filters / schema so the node is otherwise identical —
+        // removing the local `Sort` is transparent because the scan now returns rows in order.
+        let sorted = cosmos.with_order_by(OrderBy {
+            clause: keys.join(", "),
+            fetch: sort.fetch,
+        });
+        let mut new_scan = scan.clone();
+        new_scan.source = provider_as_source(Arc::new(sorted));
+        Ok(Some(LogicalPlan::TableScan(new_scan)))
+    }
+}
+
+/// The bare column name of a sort key (peeling an alias), or `None` for a computed expression.
+fn sort_column(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Column(c) => Some(c.name.as_str()),
+        Expr::Alias(a) => sort_column(&a.expr),
+        _ => None,
+    }
 }
 
 /// The bare column name behind an aggregate argument, peeling a numeric coercion `Cast` /
@@ -187,9 +275,9 @@ fn as_agg_column(expr: &Expr) -> Option<&str> {
     }
 }
 
-impl OptimizerRule for AggregatePushdown {
+impl OptimizerRule for CosmosPushdown {
     fn name(&self) -> &str {
-        "cosmos_aggregate_pushdown"
+        "cosmos_pushdown"
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {
@@ -201,11 +289,13 @@ impl OptimizerRule for AggregatePushdown {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        let LogicalPlan::Aggregate(agg) = &plan else {
-            return Ok(Transformed::no(plan));
+        let folded = match &plan {
+            LogicalPlan::Aggregate(agg) => self.try_fold_aggregate(agg)?,
+            LogicalPlan::Sort(sort) => self.try_fold_sort(sort)?,
+            _ => None,
         };
-        match self.try_fold(agg)? {
-            Some(folded) => Ok(Transformed::yes(folded)),
+        match folded {
+            Some(new_plan) => Ok(Transformed::yes(new_plan)),
             None => Ok(Transformed::no(plan)),
         }
     }
@@ -305,19 +395,20 @@ mod tests {
         let schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, true),
             Field::new("n", DataType::Int64, true),
+            Field::new("m", DataType::Int64, true),
         ]));
         let provider = CosmosTableProvider::new(client, "db".into(), "t".into(), schema);
 
         let ctx = SessionContext::new();
-        ctx.add_optimizer_rule(Arc::new(AggregatePushdown::new(config)));
+        ctx.add_optimizer_rule(Arc::new(CosmosPushdown::new(config)));
         ctx.register_table("t", Arc::new(provider))
             .expect("register table");
         ctx
     }
 
-    /// Optimize `sql` and return the pushed Cosmos SQL from the physical plan, if the aggregate
-    /// was folded (the folded plan is a `CosmosExec` over a `SELECT VALUE …` query).
-    async fn folded_sql(ctx: &SessionContext, sql: &str) -> Option<String> {
+    /// Optimize `sql` and return the single pushed Cosmos SQL string from the physical plan (the
+    /// `sql=` field of the `CosmosExec`), or `None` if there is no `CosmosExec`.
+    async fn pushed_sql(ctx: &SessionContext, sql: &str) -> Option<String> {
         let logical = ctx.state().create_logical_plan(sql).await.expect("plan");
         let optimized = ctx.state().optimize(&logical).expect("optimize");
         let physical = ctx
@@ -328,6 +419,12 @@ mod tests {
         let text = displayable(physical.as_ref()).indent(true).to_string();
         text.lines()
             .find_map(|l| l.split_once("sql=").map(|(_, s)| s.trim().to_string()))
+    }
+
+    /// The pushed SQL only when the aggregate folded (a `SELECT VALUE …` query).
+    async fn folded_sql(ctx: &SessionContext, sql: &str) -> Option<String> {
+        pushed_sql(ctx, sql)
+            .await
             .filter(|s| s.contains("SELECT VALUE"))
     }
 
@@ -376,8 +473,8 @@ mod tests {
 
         // On when explicitly enabled.
         let on = ctx_with_table(PushdownConfig {
-            count: true,
             avg: true,
+            ..PushdownConfig::default()
         });
         assert_eq!(
             folded_sql(&on, "SELECT AVG(n) FROM t").await.as_deref(),
@@ -389,8 +486,105 @@ mod tests {
     async fn count_toggle_off_keeps_local() {
         let ctx = ctx_with_table(PushdownConfig {
             count: false,
-            avg: false,
+            ..PushdownConfig::default()
         });
         assert_eq!(folded_sql(&ctx, "SELECT COUNT(*) FROM t").await, None);
+    }
+
+    // --- ORDER BY pushdown ---
+
+    /// The pushed SQL when it carries an engine-side `ORDER BY`, else `None`.
+    async fn sorted_sql(ctx: &SessionContext, sql: &str) -> Option<String> {
+        pushed_sql(ctx, sql)
+            .await
+            .filter(|s| s.contains("ORDER BY"))
+    }
+
+    #[tokio::test]
+    async fn single_numeric_order_by_pushes_when_nulls_smallest() {
+        let ctx = ctx_with_table(PushdownConfig::default());
+        // NULLS FIRST on ASC = nulls-smallest = Cosmos-equivalent.
+        assert_eq!(
+            sorted_sql(&ctx, "SELECT id, n FROM t ORDER BY n ASC NULLS FIRST")
+                .await
+                .as_deref(),
+            Some(r#"SELECT c["id"] AS id, c["n"] AS n FROM c ORDER BY c["n"] ASC"#)
+        );
+        // DESC NULLS LAST is also nulls-smallest.
+        assert_eq!(
+            sorted_sql(&ctx, "SELECT n FROM t ORDER BY n DESC NULLS LAST")
+                .await
+                .as_deref(),
+            Some(r#"SELECT c["n"] AS n FROM c ORDER BY c["n"] DESC"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn default_null_placement_stays_local() {
+        // Plain `ORDER BY n` is nulls-largest in DataFusion but nulls-smallest in Cosmos, so it
+        // must not push.
+        let ctx = ctx_with_table(PushdownConfig::default());
+        assert_eq!(sorted_sql(&ctx, "SELECT n FROM t ORDER BY n").await, None);
+    }
+
+    #[tokio::test]
+    async fn non_numeric_order_by_stays_local() {
+        // String collation is not proven equivalent, so ORDER BY on a Utf8 column stays local.
+        let ctx = ctx_with_table(PushdownConfig::default());
+        assert_eq!(
+            sorted_sql(&ctx, "SELECT id FROM t ORDER BY id ASC NULLS FIRST").await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn order_by_with_limit_pushes_top_n() {
+        let ctx = ctx_with_table(PushdownConfig::default());
+        assert_eq!(
+            sorted_sql(&ctx, "SELECT n FROM t ORDER BY n ASC NULLS FIRST LIMIT 3")
+                .await
+                .as_deref(),
+            Some(r#"SELECT c["n"] AS n FROM c ORDER BY c["n"] ASC OFFSET 0 LIMIT 3"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_column_order_by_respects_the_toggle() {
+        // Off by default → stays local.
+        let off = ctx_with_table(PushdownConfig::default());
+        assert_eq!(
+            sorted_sql(
+                &off,
+                "SELECT n, m FROM t ORDER BY n ASC NULLS FIRST, m DESC NULLS LAST"
+            )
+            .await,
+            None
+        );
+        // On when explicitly enabled.
+        let on = ctx_with_table(PushdownConfig {
+            multi_sort: true,
+            ..PushdownConfig::default()
+        });
+        assert_eq!(
+            sorted_sql(
+                &on,
+                "SELECT n, m FROM t ORDER BY n ASC NULLS FIRST, m DESC NULLS LAST"
+            )
+            .await
+            .as_deref(),
+            Some(r#"SELECT c["n"] AS n, c["m"] AS m FROM c ORDER BY c["n"] ASC, c["m"] DESC"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn sort_toggle_off_keeps_local() {
+        let ctx = ctx_with_table(PushdownConfig {
+            sort: false,
+            ..PushdownConfig::default()
+        });
+        assert_eq!(
+            sorted_sql(&ctx, "SELECT n FROM t ORDER BY n ASC NULLS FIRST").await,
+            None
+        );
     }
 }

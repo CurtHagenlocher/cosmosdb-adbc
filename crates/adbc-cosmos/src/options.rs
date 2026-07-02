@@ -52,6 +52,12 @@ pub const PUSHDOWN_COUNT: &str = "adbc.cosmos.pushdown.count";
 /// Fold `AVG(col)` to `SELECT VALUE AVG(col)` in the `datafusion` dialect: `off` (default) | `on`.
 /// Off by default — Cosmos aggregate null semantics may differ from ANSI SQL (see design §3.2).
 pub const PUSHDOWN_AVG: &str = "adbc.cosmos.pushdown.avg";
+/// Push a single-column numeric `ORDER BY` into the engine (`datafusion` dialect): `on` (default)
+/// | `off`. Only nulls-smallest, numeric keys are pushed; anything else sorts locally (§3.2).
+pub const PUSHDOWN_SORT: &str = "adbc.cosmos.pushdown.sort";
+/// Also push a **multi**-column `ORDER BY` (`datafusion` dialect): `off` (default) | `on`. Needs a
+/// Cosmos composite index in production; the analog of ODBC `EnableSortPassdownForMultipleColumns`.
+pub const PUSHDOWN_MULTI_SORT: &str = "adbc.cosmos.pushdown.multi_sort";
 
 /// Extract a string option value, or error if the caller passed a non-string.
 pub(crate) fn require_string(key: &str, value: OptionValue) -> Result<String> {

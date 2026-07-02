@@ -21,12 +21,25 @@ use futures::TryStreamExt;
 
 use crate::{convert, predicate};
 
+/// A pushed `ORDER BY` (Cosmos clause + optional top-N), folded into a scan by the sort
+/// pushdown rule so the engine sorts server-side.
+#[derive(Debug, Clone)]
+pub(crate) struct OrderBy {
+    /// Ready-to-emit Cosmos clause, e.g. `c["a"] ASC, c["b"] DESC`.
+    pub clause: String,
+    /// Optional `ORDER BY … LIMIT n` top-N.
+    pub fetch: Option<usize>,
+}
+
 /// A single Cosmos container exposed as a DataFusion table with an inferred schema.
 pub struct CosmosTableProvider {
     client: Arc<CosmosClientHandle>,
     database: String,
     container: String,
     schema: SchemaRef,
+    /// Set only on the synthetic provider the sort pushdown rule substitutes in; appends the
+    /// engine-side `ORDER BY` (and any top-N) to every generated query.
+    order_by: Option<OrderBy>,
 }
 
 impl CosmosTableProvider {
@@ -41,6 +54,19 @@ impl CosmosTableProvider {
             database,
             container,
             schema,
+            order_by: None,
+        }
+    }
+
+    /// The same provider with a pushed `ORDER BY` — used by the sort pushdown rule to replace a
+    /// `Sort` over this container. Projection/filter/limit handling is unchanged.
+    pub(crate) fn with_order_by(&self, order_by: OrderBy) -> Self {
+        Self {
+            client: self.client.clone(),
+            database: self.database.clone(),
+            container: self.container.clone(),
+            schema: self.schema.clone(),
+            order_by: Some(order_by),
         }
     }
 
@@ -100,8 +126,15 @@ impl TableProvider for CosmosTableProvider {
         } else {
             Some(clauses.join(" AND "))
         };
+        // On the synthetic sort provider, emit the pushed ORDER BY; its top-N takes precedence
+        // over DataFusion's `limit` (the two never coexist — a LIMIT below the sort blocks the
+        // fold). Otherwise this is the plain projection/filter/limit scan.
+        let (order_by, limit) = match &self.order_by {
+            Some(o) => (Some(o.clause.as_str()), o.fetch.or(limit)),
+            None => (None, limit),
+        };
         let (projected_schema, sql) =
-            convert::build_scan_sql(&self.schema, projection, where_clause.as_deref(), limit);
+            convert::build_scan_sql(&self.schema, projection, where_clause.as_deref(), order_by, limit);
         Ok(Arc::new(CosmosExec::new(
             self.client.clone(),
             self.database.clone(),

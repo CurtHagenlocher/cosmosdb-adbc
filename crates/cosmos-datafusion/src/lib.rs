@@ -49,9 +49,10 @@ pub fn register_cosmos_schema(
     Ok(())
 }
 
-/// Install the Cosmos aggregate-pushdown optimizer rule on `ctx`, folding a whole-container
-/// `COUNT(*)` / `AVG(col)` into one `SELECT VALUE …` round-trip per [`PushdownConfig`]. Call
-/// once per context before planning; unaffected queries plan exactly as before.
+/// Install the Cosmos pushdown optimizer rule on `ctx`, folding a whole-container `COUNT(*)` /
+/// `AVG(col)` into one `SELECT VALUE …` round-trip and pushing an equivalent `ORDER BY` into the
+/// engine per [`PushdownConfig`]. Call once per context before planning; unaffected queries plan
+/// exactly as before.
 pub fn install_pushdown(ctx: &SessionContext, config: PushdownConfig) {
-    ctx.add_optimizer_rule(Arc::new(pushdown::AggregatePushdown::new(config)));
+    ctx.add_optimizer_rule(Arc::new(pushdown::CosmosPushdown::new(config)));
 }

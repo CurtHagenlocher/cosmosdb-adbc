@@ -62,9 +62,11 @@ pub struct CosmosStatement {
     infer_temporal: bool,
     epoch_fields: HashMap<String, TimeUnit>,
     heterogeneous: HeterogeneousMode,
-    // `datafusion`-dialect aggregate pushdown toggles (DESIGN §3.2); see `pushdown_config`.
+    // `datafusion`-dialect pushdown toggles (DESIGN §3.2); see `pushdown_config`.
     pushdown_count: bool,
     pushdown_avg: bool,
+    pushdown_sort: bool,
+    pushdown_multi_sort: bool,
     /// Shared container-schema cache for the `datafusion` dialect (owned by the connection).
     schema_cache: Arc<cosmos_datafusion::SchemaCache>,
     query: Option<String>,
@@ -94,15 +96,19 @@ impl CosmosStatement {
             heterogeneous: HeterogeneousMode::default(),
             pushdown_count: true,
             pushdown_avg: false,
+            pushdown_sort: true,
+            pushdown_multi_sort: false,
             query: None,
         }
     }
 
-    /// The `datafusion`-dialect aggregate pushdown configuration from the parsed toggles.
+    /// The `datafusion`-dialect pushdown configuration from the parsed toggles.
     fn pushdown_config(&self) -> cosmos_datafusion::PushdownConfig {
         cosmos_datafusion::PushdownConfig {
             count: self.pushdown_count,
             avg: self.pushdown_avg,
+            sort: self.pushdown_sort,
+            multi_sort: self.pushdown_multi_sort,
         }
     }
 
@@ -424,6 +430,18 @@ impl Optionable for CosmosStatement {
                         &options::require_string(options::PUSHDOWN_AVG, value)?,
                     )?;
                 }
+                options::PUSHDOWN_SORT => {
+                    self.pushdown_sort = parse_bool_onoff(
+                        options::PUSHDOWN_SORT,
+                        &options::require_string(options::PUSHDOWN_SORT, value)?,
+                    )?;
+                }
+                options::PUSHDOWN_MULTI_SORT => {
+                    self.pushdown_multi_sort = parse_bool_onoff(
+                        options::PUSHDOWN_MULTI_SORT,
+                        &options::require_string(options::PUSHDOWN_MULTI_SORT, value)?,
+                    )?;
+                }
                 _ => return Err(ErrorHelper::set_unknown_option(&key).to_adbc()),
             },
             _ => return Err(ErrorHelper::set_unknown_option(&key).to_adbc()),
@@ -449,6 +467,8 @@ impl Optionable for CosmosStatement {
                     .ok_or_else(|| ErrorHelper::get_unknown_option(&key).to_adbc()),
                 options::PUSHDOWN_COUNT => Ok(onoff(self.pushdown_count)),
                 options::PUSHDOWN_AVG => Ok(onoff(self.pushdown_avg)),
+                options::PUSHDOWN_SORT => Ok(onoff(self.pushdown_sort)),
+                options::PUSHDOWN_MULTI_SORT => Ok(onoff(self.pushdown_multi_sort)),
                 _ => Err(ErrorHelper::get_unknown_option(&key).to_adbc()),
             },
             _ => Err(ErrorHelper::get_unknown_option(&key).to_adbc()),

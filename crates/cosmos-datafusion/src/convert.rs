@@ -74,6 +74,7 @@ pub(crate) fn build_scan_sql(
     full_schema: &SchemaRef,
     projection: Option<&Vec<usize>>,
     where_clause: Option<&str>,
+    order_by: Option<&str>,
     limit: Option<usize>,
 ) -> (SchemaRef, String) {
     let (schema, select) = match projection {
@@ -94,6 +95,10 @@ pub(crate) fn build_scan_sql(
     let mut sql = format!("SELECT {select} FROM c");
     if let Some(clause) = where_clause {
         sql.push_str(&format!(" WHERE {clause}"));
+    }
+    // ORDER BY must precede OFFSET/LIMIT so a top-N applies after the sort.
+    if let Some(order) = order_by {
+        sql.push_str(&format!(" ORDER BY {order}"));
     }
     if let Some(n) = limit {
         sql.push_str(&format!(" OFFSET 0 LIMIT {n}"));
@@ -121,6 +126,7 @@ mod tests {
             &s,
             Some(&vec![0, 1]),
             Some(r#"(IS_DEFINED(c["mergeOrder"]) AND NOT IS_NULL(c["mergeOrder"]) AND (c["mergeOrder"] > 25))"#),
+            None,
             Some(10),
         );
         assert_eq!(
@@ -134,13 +140,28 @@ mod tests {
 
     #[test]
     fn no_projection_no_filter_is_select_star() {
-        let (_, sql) = build_scan_sql(&schema(), None, None, None);
+        let (_, sql) = build_scan_sql(&schema(), None, None, None, None);
         assert_eq!(sql, "SELECT * FROM c");
     }
 
     #[test]
     fn where_clause_precedes_offset_limit() {
-        let (_, sql) = build_scan_sql(&schema(), None, Some("(c[\"a\"] = 1)"), Some(5));
+        let (_, sql) = build_scan_sql(&schema(), None, Some("(c[\"a\"] = 1)"), None, Some(5));
         assert_eq!(sql, "SELECT * FROM c WHERE (c[\"a\"] = 1) OFFSET 0 LIMIT 5");
+    }
+
+    #[test]
+    fn order_by_sits_between_where_and_limit() {
+        let (_, sql) = build_scan_sql(
+            &schema(),
+            None,
+            Some("(c[\"a\"] = 1)"),
+            Some(r#"c["mergeOrder"] ASC"#),
+            Some(5),
+        );
+        assert_eq!(
+            sql,
+            r#"SELECT * FROM c WHERE (c["a"] = 1) ORDER BY c["mergeOrder"] ASC OFFSET 0 LIMIT 5"#
+        );
     }
 }
