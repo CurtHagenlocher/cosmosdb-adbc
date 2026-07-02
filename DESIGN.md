@@ -238,7 +238,8 @@ and beats it on structure.
    it does not yet emit Variant decimals** (upstream `// Todo`). So under `number_inference=decimal`
    the decimal typing applies to `struct` columns today; `variant` numbers stay `Double` until the
    library supports decimal encoding (a library limitation we document, not a designed asymmetry —
-   revisit when upstream lands it, or hand-roll only if a user needs it sooner).
+   revisit when upstream lands it, or hand-roll only if a user needs it sooner). Decimal typing
+   **recurses** into nested `Struct`/`List` (any nested `Float64` → `Decimal128`).
 2. **Heterogeneous / type-conflicting fields (`heterogeneous`).** These would otherwise crash —
    `infer_json_schema_from_iterator` **errors** on a path that's a scalar in one doc and an
    object/array in another, and even for scalar-vs-scalar the `Decoder` rejects the non-string
@@ -255,10 +256,11 @@ and beats it on structure.
    *type transforms* (below) remain top-level; conflict normalization is fully recursive.
 3. **Dates/datetimes from strings (`infer_temporal`, default `off`).** ISO-8601 string → `Date32`/
    `Timestamp` is pattern-guessing and can misfire on a field that merely looks date-like; the ODBC
-   driver doesn't do it, so we default off and make it explicit opt-in.
+   driver doesn't do it, so we default off and make it explicit opt-in. **Recurses** into nested
+   `Struct`/`List` (a `Utf8` becomes temporal only when *every* sampled value at that path is ISO).
 4. **Epoch numbers → timestamps (`epoch_fields`).** A bare number can't be distinguished from an ID
    or count, so Unix-timestamp inference is **never** automatic — the user names the fields and unit
-   (`_ts:s`, `createdAt:ms`).
+   (`_ts:s`, `createdAt:ms`). Matches **top-level** field names only (nested paths aren't addressable).
 5. **Nested objects/arrays → `Struct`/`List`** by default (lossless), with `Variant` or JSON-string
    as per-field fallbacks under heterogeneity or low sample confidence.
 
@@ -395,6 +397,15 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
 
 ## 8. Build status
 
+- **Nested §3.5 type transforms — DONE, live-verified (2026-07-02).** `number_inference=decimal`
+  (`Float64` → `Decimal128`) and `infer_temporal` (ISO string → `Date32`/`Timestamp`) now recurse
+  into nested `Struct` fields and `List` elements — the top-level-only `decide_type`/`FieldProfile`
+  is replaced by a recursive `transform_type` + a recursive `NodeProfile` (ISO tallies per path, so
+  a nested `Utf8` becomes temporal only when every sampled value there is ISO). `epoch_fields`
+  stays top-level (name-based). arrow-json's `Decoder` accepts the nested `Decimal128`/`Date32`/
+  `Timestamp` targets. Seed `items.nested` gained `ratio` (float) + `day` (ISO date). Tests:
+  inference unit (nested decimal + temporal) and a live test (`nested.ratio`→`Decimal128`,
+  `nested.day`→`Date32`, `nested.k` stays `Int64`).
 - **Nested/recursive conflict handling — DONE, live-verified (2026-07-02).** Extended
   heterogeneous handling to conflicts at *any depth*. New shared `cosmos_datafusion::normalize`:
   computes a merged JSON *shape* across sampled docs and stringifies exactly the conflicting nodes

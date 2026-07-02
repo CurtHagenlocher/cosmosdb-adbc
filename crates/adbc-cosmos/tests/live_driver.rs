@@ -383,6 +383,40 @@ fn struct_heterogeneous_field_as_variant() {
 
 #[test]
 #[ignore = "requires the local Cosmos emulator (run cosmos-client's seed example first)"]
+fn struct_inference_knobs_recurse_into_nested() {
+    use arrow_schema::DataType;
+
+    let mut conn = open_connection();
+    let mut stmt = conn.new_statement().expect("new_statement");
+    for (k, v) in [
+        ("adbc.cosmos.container", "items"),
+        ("adbc.cosmos.output", "struct"),
+        ("adbc.cosmos.number_inference", "decimal"),
+        ("adbc.cosmos.decimal", "20,4"),
+        ("adbc.cosmos.infer_temporal", "on"),
+    ] {
+        stmt.set_option(OptionStatement::Other(k.into()), OptionValue::String(v.into()))
+            .expect("set option");
+    }
+    stmt.set_sql_query("SELECT * FROM c").expect("set query");
+
+    let reader = stmt.execute().expect("execute");
+    let schema = reader.schema();
+    // `nested` is a struct: `ratio` (nested float) → Decimal128, `day` (nested ISO date) → Date32,
+    // `k` (nested int) stays Int64.
+    let DataType::Struct(nested) = schema.field_with_name("nested").unwrap().data_type() else {
+        panic!("nested should be a Struct");
+    };
+    let field = |name: &str| nested.iter().find(|f| f.name() == name).unwrap().data_type().clone();
+    assert_eq!(field("ratio"), DataType::Decimal128(20, 4));
+    assert_eq!(field("day"), DataType::Date32);
+    assert_eq!(field("k"), DataType::Int64);
+    let rows: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
+    assert_eq!(rows, 50);
+}
+
+#[test]
+#[ignore = "requires the local Cosmos emulator (run cosmos-client's seed example first)"]
 fn metadata_get_table_types_lists_table() {
     let conn = open_connection();
     let reader = conn.get_table_types().expect("get_table_types");

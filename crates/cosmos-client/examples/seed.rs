@@ -61,7 +61,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "name": format!("item {i}"),
             "value": (i as f64) * 1.5,
             "tags": ["a", "b"],
-            "nested": { "k": i }
+            // `ratio` (nested float) and `day` (nested ISO date) exercise recursive §3.5
+            // transforms (decimal / infer_temporal) inside a struct.
+            "nested": { "k": i, "ratio": (i as f64) * 0.5, "day": "2020-01-01" }
         });
         container_client.upsert_item(pk.clone(), &doc, None).await?;
     }

@@ -9,8 +9,9 @@
 //! and integers into `Timestamp`). A top-level conflicting field can instead be carried as a
 //! self-describing Variant column (`heterogeneous=variant`, `variant` feature).
 //!
-//! Transforms are top-level only; the conflict *normalization* is fully recursive. All knobs
-//! default off/float64 so behavior matches plain inference until a user opts in.
+//! `number_inference=decimal` and `infer_temporal` recurse into nested `Struct`/`List` types;
+//! `epoch_fields` matches top-level field names only. Conflict normalization is fully recursive.
+//! All knobs default off/float64 so behavior matches plain inference until a user opts in.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -100,18 +101,20 @@ pub fn build_struct_batch(
     }
     .map_err(|e| arrow_err("infer_json_schema", e))?;
 
-    // Apply top-level type transforms and decode the normalized documents (variant fields aren't
-    // in the schema, so the Decoder ignores them).
-    let profiles = profile_fields(sample);
+    // Apply §3.5 type transforms and decode the normalized documents (variant fields aren't in the
+    // schema, so the Decoder ignores them). `decimal`/`infer_temporal` recurse into nested
+    // structs/lists; `epoch_fields` matches top-level field names only.
+    let root = build_node_profile(&normalized[..sample_end]);
     let decode_fields: Vec<Field> = base
         .fields()
         .iter()
         .map(|f| {
-            Field::new(
-                f.name(),
-                decide_type(f.name(), f.data_type(), profiles.get(f.name()), opts),
-                true,
-            )
+            let dt = if let Some(unit) = opts.epoch_fields.get(f.name()) {
+                DataType::Timestamp(*unit, None)
+            } else {
+                transform_type(f.data_type(), root.fields.get(f.name()), opts)
+            };
+            Field::new(f.name(), dt, true)
         })
         .collect();
     let decode_schema = Arc::new(Schema::new(decode_fields));
@@ -231,47 +234,59 @@ fn decode(schema: Arc<Schema>, docs: &[Value]) -> Result<RecordBatch> {
         .unwrap_or_else(|| RecordBatch::new_empty(schema)))
 }
 
-/// Decide the Arrow type for one homogeneous top-level field. Precedence: epoch → temporal →
-/// decimal → base. (Heterogeneous fields are handled separately and never reach here.)
-fn decide_type(
-    name: &str,
-    base: &DataType,
-    profile: Option<&FieldProfile>,
-    opts: &InferenceOptions,
-) -> DataType {
-    if let Some(unit) = opts.epoch_fields.get(name) {
-        return DataType::Timestamp(*unit, None);
-    }
-    if opts.infer_temporal && matches!(base, DataType::Utf8) {
-        if let Some(p) = profile {
-            if p.all_datetime() {
-                return DataType::Timestamp(TimeUnit::Microsecond, None);
-            }
-            if p.all_date() {
-                return DataType::Date32;
+/// Recursively transform an inferred type per the §3.5 knobs: `Float64` → `Decimal128(p,s)` under
+/// `number_inference=decimal`, and `Utf8` → `Date32`/`Timestamp` under `infer_temporal` when every
+/// sampled value at that path is an ISO-8601 date/datetime (from `profile`). Recurses into
+/// `Struct` fields and `List` elements so nested numbers/strings are transformed too.
+fn transform_type(dt: &DataType, profile: Option<&NodeProfile>, opts: &InferenceOptions) -> DataType {
+    match dt {
+        DataType::Float64 => {
+            if let NumberMode::Decimal { precision, scale } = opts.number {
+                DataType::Decimal128(precision, scale)
+            } else {
+                dt.clone()
             }
         }
-    }
-    if let NumberMode::Decimal { precision, scale } = opts.number {
-        if matches!(base, DataType::Float64) {
-            return DataType::Decimal128(precision, scale);
+        DataType::Utf8 if opts.infer_temporal => match profile {
+            Some(p) if p.all_datetime() => DataType::Timestamp(TimeUnit::Microsecond, None),
+            Some(p) if p.all_date() => DataType::Date32,
+            _ => dt.clone(),
+        },
+        DataType::Struct(fields) => {
+            let transformed: Vec<Field> = fields
+                .iter()
+                .map(|f| {
+                    let sub = profile.and_then(|p| p.fields.get(f.name()));
+                    Field::new(f.name(), transform_type(f.data_type(), sub, opts), f.is_nullable())
+                })
+                .collect();
+            DataType::Struct(transformed.into())
         }
+        DataType::List(field) => {
+            let sub = profile.and_then(|p| p.element.as_deref());
+            let element =
+                Field::new(field.name(), transform_type(field.data_type(), sub, opts), field.is_nullable());
+            DataType::List(Arc::new(element))
+        }
+        other => other.clone(),
     }
-    base.clone()
 }
 
-// ── field profiling (top-level, for temporal inference) ──────────────────────
+// ── recursive value profiling (for temporal inference at any depth) ──────────
 
-/// Per-field tallies over the sample used to decide temporal inference: a field is treated as a
-/// date/datetime only if *every* non-null value is an ISO-8601 date/datetime string.
+/// Tallies over the sampled values at one JSON node (and, recursively, its object fields and array
+/// elements). A `Utf8` node is treated as a date/datetime only if *every* non-null value there is
+/// an ISO-8601 date/datetime string.
 #[derive(Default)]
-struct FieldProfile {
+struct NodeProfile {
     non_null: usize,
     iso_date: usize,
     iso_datetime: usize,
+    fields: HashMap<String, NodeProfile>,
+    element: Option<Box<NodeProfile>>,
 }
 
-impl FieldProfile {
+impl NodeProfile {
     fn observe(&mut self, v: &Value) {
         match v {
             Value::Null => {}
@@ -282,6 +297,19 @@ impl FieldProfile {
                     self.iso_date += 1;
                 }
                 self.non_null += 1;
+            }
+            Value::Object(map) => {
+                self.non_null += 1;
+                for (k, val) in map {
+                    self.fields.entry(k.clone()).or_default().observe(val);
+                }
+            }
+            Value::Array(items) => {
+                self.non_null += 1;
+                let element = self.element.get_or_insert_with(Box::default);
+                for item in items {
+                    element.observe(item);
+                }
             }
             _ => self.non_null += 1,
         }
@@ -296,16 +324,13 @@ impl FieldProfile {
     }
 }
 
-fn profile_fields(sample: &[Value]) -> HashMap<String, FieldProfile> {
-    let mut map: HashMap<String, FieldProfile> = HashMap::new();
+/// Build the root profile by observing each document (whose top-level fields land in `.fields`).
+fn build_node_profile(sample: &[Value]) -> NodeProfile {
+    let mut root = NodeProfile::default();
     for doc in sample {
-        if let Value::Object(obj) = doc {
-            for (k, v) in obj {
-                map.entry(k.clone()).or_default().observe(v);
-            }
-        }
+        root.observe(doc);
     }
-    map
+    root
 }
 
 fn is_iso_date(s: &str) -> bool {
@@ -443,6 +468,43 @@ mod tests {
         let batch = build_struct_batch(&docs, 1000, &InferenceOptions::default()).unwrap();
         assert_eq!(batch.num_rows(), 2);
         assert!(matches!(dtype(&batch.schema(), "a"), DataType::Struct(_)));
+    }
+
+    #[test]
+    fn decimal_recurses_into_nested_struct_and_list() {
+        let docs = vec![json!({"o": {"f": 1.5}, "arr": [2.5, 3.5]})];
+        let opts = InferenceOptions {
+            number: NumberMode::Decimal { precision: 20, scale: 4 },
+            ..Default::default()
+        };
+        let batch = build_struct_batch(&docs, 1000, &opts).unwrap();
+        let schema = batch.schema();
+        // nested struct field o.f -> Decimal128
+        let DataType::Struct(o) = dtype(&schema, "o") else { panic!("o is Struct") };
+        assert_eq!(
+            o.iter().find(|f| f.name() == "f").unwrap().data_type(),
+            &DataType::Decimal128(20, 4)
+        );
+        // list element -> Decimal128
+        let DataType::List(el) = dtype(&schema, "arr") else { panic!("arr is List") };
+        assert_eq!(el.data_type(), &DataType::Decimal128(20, 4));
+    }
+
+    #[test]
+    fn temporal_recurses_into_nested_struct() {
+        let docs = vec![
+            json!({"o": {"d": "2021-06-15", "dt": "2021-06-15T10:30:00Z"}}),
+            json!({"o": {"d": "2022-01-01", "dt": "2022-01-01T00:00:00Z"}}),
+        ];
+        let opts = InferenceOptions { infer_temporal: true, ..Default::default() };
+        let batch = build_struct_batch(&docs, 1000, &opts).unwrap();
+        let schema = batch.schema();
+        let DataType::Struct(o) = dtype(&schema, "o") else { panic!("o is Struct") };
+        assert_eq!(o.iter().find(|f| f.name() == "d").unwrap().data_type(), &DataType::Date32);
+        assert_eq!(
+            o.iter().find(|f| f.name() == "dt").unwrap().data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
     }
 
     #[test]
