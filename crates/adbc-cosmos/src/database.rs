@@ -19,12 +19,19 @@ use crate::runtime::Runtime;
 pub struct DatabaseConfig {
     /// Cosmos account endpoint URI.
     pub endpoint: Option<String>,
-    /// Authentication mode: `entra` | `key` | `connection_string`.
+    /// Authentication mode: `entra` | `managed_identity` | `service_principal` |
+    /// `workload_identity` | `key` | `connection_string`.
     pub auth: Option<String>,
     /// Account key (secret; never returned via `get_option`).
     pub account_key: Option<String>,
     /// Full connection string (secret; never returned via `get_option`).
     pub connection_string: Option<String>,
+    /// Entra tenant (directory) ID (service principal / workload identity).
+    pub tenant_id: Option<String>,
+    /// Entra client (application) ID (service principal, user-assigned MI / workload identity).
+    pub client_id: Option<String>,
+    /// Service-principal client secret (secret; never returned via `get_option`).
+    pub client_secret: Option<String>,
     /// Default database name.
     pub database: Option<String>,
 }
@@ -96,6 +103,16 @@ impl Optionable for CosmosDatabase {
                     self.config.connection_string =
                         Some(options::require_string(options::CONNECTION_STRING, value)?);
                 }
+                options::TENANT_ID => {
+                    self.config.tenant_id = Some(options::require_string(options::TENANT_ID, value)?);
+                }
+                options::CLIENT_ID => {
+                    self.config.client_id = Some(options::require_string(options::CLIENT_ID, value)?);
+                }
+                options::CLIENT_SECRET => {
+                    self.config.client_secret =
+                        Some(options::require_string(options::CLIENT_SECRET, value)?);
+                }
                 options::DATABASE => {
                     self.config.database = Some(options::require_string(options::DATABASE, value)?);
                 }
@@ -113,6 +130,8 @@ impl Optionable for CosmosDatabase {
             OptionDatabase::Other(k) => match k.as_str() {
                 options::ENDPOINT => self.config.endpoint.clone(),
                 options::AUTH => self.config.auth.clone(),
+                options::TENANT_ID => self.config.tenant_id.clone(),
+                options::CLIENT_ID => self.config.client_id.clone(),
                 options::DATABASE => self.config.database.clone(),
                 _ => None,
             },

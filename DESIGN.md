@@ -189,8 +189,9 @@ Three crates, layered so DataFusion/Arrow/ADBC types never leak into transport (
 | Key | Level | Values | Notes |
 |---|---|---|---|
 | `adbc.cosmos.endpoint` | Database | account URI | |
-| `adbc.cosmos.auth` | Database | `entra` \| `key` \| `connection_string` | Entra = `DefaultAzureCredential` |
+| `adbc.cosmos.auth` | Database | `entra` \| `managed_identity` \| `service_principal` \| `workload_identity` \| `key` \| `connection_string` | default: key if a key is set, else `entra` (dev sign-in) |
 | `adbc.cosmos.account_key` / `.connection_string` | Database | secret | |
+| `adbc.cosmos.tenant_id` / `.client_id` / `.client_secret` | Database | Entra IDs / secret | service principal (all three); user-assigned MI / workload identity (`client_id`[/`tenant_id`]) |
 | `adbc.cosmos.database` | Database/Connection | db name | default catalog |
 | `adbc.cosmos.consistency` | Connection | Cosmos consistency level | default Session |
 | `adbc.cosmos.dialect` | Statement | `native` \| `datafusion` | per-statement toggle |
@@ -389,14 +390,23 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
 - **Corrections vs initial research:** `azure_data_cosmos` IS published (pin `=0.29.0` for the seam);
   `azure_data_cosmos_engine` is NOT published (git dep); adbc main is 0.24 (we target 0.23).
 - **Auth (verified while building Spike A):** `azure_identity` 0.30 has **no** all-in-one
-  `DefaultAzureCredential`. The Entra path uses `DeveloperToolsCredential::new(None)` (az/azd
-  developer sign-in); production managed-identity/service-principal will select explicitly among
-  `ManagedIdentityCredential` / `ClientSecretCredential` / `WorkloadIdentityCredential` in Phase 1.
-  Account-key auth is `CosmosClient::with_key(endpoint, Secret, None)` (feature `key_auth`);
-  connection-string is `CosmosClient::with_connection_string(Secret, None)`.
+  `DefaultAzureCredential`. The `entra` mode uses `DeveloperToolsCredential::new(None)` (az/azd
+  developer sign-in); production auth now selects explicitly among `ManagedIdentityCredential` /
+  `ClientSecretCredential` / `WorkloadIdentityCredential` (DONE — see §8). Account-key auth is
+  `CosmosClient::with_key(endpoint, Secret, None)` (feature `key_auth`); connection-string is
+  `CosmosClient::with_connection_string(Secret, None)`.
 
 ## 8. Build status
 
+- **Production Entra auth — DONE (2026-07-02).** Beyond account key / connection string / Entra
+  developer sign-in, `adbc.cosmos.auth` now selects explicit `managed_identity` (system- or
+  user-assigned via `client_id`), `service_principal` (`tenant_id`+`client_id`+`client_secret`,
+  `ClientSecretCredential`), and `workload_identity` (AKS federation; ids/token-file default to
+  `AZURE_*` env). `cosmos-client`'s `Credential` enum gained these variants; credential construction
+  is offline (token acquisition deferred to first query). `adbc-cosmos` parses `tenant_id`/
+  `client_id`/`client_secret` (secret, not readable back) and maps them via a pure, unit-tested
+  `credential_from` (7 tests: precedence, required-field errors, optional ids). Not live-verifiable
+  against the emulator (no real Entra); the mapping + offline construction are the testable surface.
 - **Nested §3.5 type transforms — DONE, live-verified (2026-07-02).** `number_inference=decimal`
   (`Float64` → `Decimal128`) and `infer_temporal` (ISO string → `Date32`/`Timestamp`) now recurse
   into nested `Struct` fields and `List` elements — the top-level-only `decide_type`/`FieldProfile`

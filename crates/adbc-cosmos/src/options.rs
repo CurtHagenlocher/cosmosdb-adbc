@@ -16,6 +16,13 @@ pub const ENDPOINT: &str = "adbc.cosmos.endpoint";
 pub const AUTH: &str = "adbc.cosmos.auth";
 /// Account key (also accepted via the canonical `OptionDatabase::Password`).
 pub const ACCOUNT_KEY: &str = "adbc.cosmos.account_key";
+/// Entra tenant (directory) ID — for `service_principal` / `workload_identity`.
+pub const TENANT_ID: &str = "adbc.cosmos.tenant_id";
+/// Entra client (application) ID — for `service_principal` and user-assigned
+/// `managed_identity` / `workload_identity`.
+pub const CLIENT_ID: &str = "adbc.cosmos.client_id";
+/// Service-principal client secret (secret; never returned via `get_option`).
+pub const CLIENT_SECRET: &str = "adbc.cosmos.client_secret";
 /// Full Cosmos connection string (`AccountEndpoint=...;AccountKey=...;`).
 pub const CONNECTION_STRING: &str = "adbc.cosmos.connection_string";
 /// Default Cosmos database name (maps to the ADBC current catalog).
