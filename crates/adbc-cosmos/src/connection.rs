@@ -83,7 +83,11 @@ impl Connection for CosmosConnection {
         table_type: Option<Vec<&str>>,
         column_name: Option<&str>,
     ) -> Result<Box<dyn RecordBatchReader + Send>> {
-        let inner = crate::metadata::CosmosGetObjects::new(self.client.clone(), self.runtime.clone());
+        let inner = crate::metadata::CosmosGetObjects::new(
+            self.client.clone(),
+            self.runtime.clone(),
+            self.schema_cache.clone(),
+        );
         Ok(driverbase::get_objects::get_objects(
             inner, depth, catalog, db_schema, table_name, table_type, column_name,
         ))
@@ -104,9 +108,14 @@ impl Connection for CosmosConnection {
                     .message("get_table_schema requires a catalog (database) or a current database")
                     .to_adbc()
             })?;
-        let schema =
-            crate::metadata::sample_schema(&self.client, &self.runtime, &database, table_name)
-                .map_err(|e| e.to_adbc())?;
+        let schema = crate::metadata::sample_schema(
+            &self.client,
+            &self.runtime,
+            &self.schema_cache,
+            &database,
+            table_name,
+        )
+        .map_err(|e| e.to_adbc())?;
         Ok(schema.as_ref().clone())
     }
 

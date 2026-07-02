@@ -10,6 +10,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use cosmos_client::CosmosClientHandle;
+use cosmos_datafusion::SchemaCache;
 use driverbase::error::ErrorHelper as _;
 use driverbase::get_objects::{ColumnInfo, GetObjectsImpl, TableAndColumnInfo, TableInfo};
 use regex::Regex;
@@ -29,14 +30,21 @@ const DEFAULT_SCHEMA: &str = "";
 const TABLE_TYPE: &str = "table";
 
 /// Sample a container and infer its Arrow schema (shared by `get_objects` columns and
-/// `get_table_schema`). Returns a `driverbase` error; the ADBC boundary maps it with
-/// `.to_adbc()`.
+/// `get_table_schema`). Reuses the connection's [`SchemaCache`] — shared with the `datafusion`
+/// dialect — so repeated metadata calls (and queries) don't re-sample the same container. The
+/// cached schema is a best-effort snapshot; whichever path samples first wins. Returns a
+/// `driverbase` error; the ADBC boundary maps it with `.to_adbc()`.
 pub(crate) fn sample_schema(
     client: &CosmosClientHandle,
     runtime: &Runtime,
+    cache: &SchemaCache,
     database: &str,
     container: &str,
 ) -> Result<Arc<Schema>, DriverError> {
+    let key = (database.to_string(), container.to_string());
+    if let Some(schema) = cache.lock().expect("schema cache poisoned").get(&key).cloned() {
+        return Ok(schema);
+    }
     let sql = format!("SELECT * FROM c OFFSET 0 LIMIT {METADATA_SAMPLE_SIZE}");
     let docs = runtime
         .block_on(async { client.query_documents(database, container, &sql).await })
@@ -45,7 +53,12 @@ pub(crate) fn sample_schema(
                 .message(format!("sampling '{database}/{container}': {e}"))
         })?;
     // ArrowError → DriverError via `From`.
-    Ok(crate::output::infer_struct_schema(&docs, METADATA_SAMPLE_SIZE)?)
+    let schema = crate::output::infer_struct_schema(&docs, METADATA_SAMPLE_SIZE)?;
+    // Don't cache an empty schema from an empty container — it may gain documents later.
+    if !docs.is_empty() {
+        cache.lock().expect("schema cache poisoned").insert(key, schema.clone());
+    }
+    Ok(schema)
 }
 
 /// A one-row reader listing the single Cosmos table type, for `Connection::get_table_types`.
@@ -68,11 +81,20 @@ pub(crate) fn table_types_reader() -> Box<dyn RecordBatchReader + Send> {
 pub(crate) struct CosmosGetObjects {
     client: Arc<CosmosClientHandle>,
     runtime: Arc<Runtime>,
+    cache: Arc<SchemaCache>,
 }
 
 impl CosmosGetObjects {
-    pub(crate) fn new(client: Arc<CosmosClientHandle>, runtime: Arc<Runtime>) -> Self {
-        Self { client, runtime }
+    pub(crate) fn new(
+        client: Arc<CosmosClientHandle>,
+        runtime: Arc<Runtime>,
+        cache: Arc<SchemaCache>,
+    ) -> Self {
+        Self {
+            client,
+            runtime,
+            cache,
+        }
     }
 }
 
@@ -142,7 +164,8 @@ impl GetObjectsImpl<ErrorHelper> for CosmosGetObjects {
         let column_re = column_filter.map(like_to_regex).transpose()?;
         let mut out = Vec::with_capacity(tables.len());
         for table in tables {
-            let schema = sample_schema(&self.client, &self.runtime, catalog, &table.table_name)?;
+            let schema =
+                sample_schema(&self.client, &self.runtime, &self.cache, catalog, &table.table_name)?;
             let columns = schema
                 .fields()
                 .iter()
@@ -186,4 +209,38 @@ fn like_to_regex(pattern: &str) -> Result<Regex, DriverError> {
     Regex::new(&re).map_err(|e| {
         ErrorHelper::invalid_argument().message(format!("invalid search pattern '{pattern}': {e}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field};
+    use cosmos_client::Credential;
+
+    /// A cache hit in `sample_schema` returns the memoized schema without sampling — the
+    /// client points at an unreachable endpoint, so a miss would network and error.
+    #[test]
+    fn sample_schema_uses_cache() {
+        let client = CosmosClientHandle::connect(
+            "https://127.0.0.1:1/",
+            Credential::Key(
+                "C2y6yDjf5/R+ob0N8A7Cgv30VRDJIWEHLM+4QDU5DE2nQ9nDuVTqobD4b8mGGyPMbIZnqyMsEcaGQy67XIw/Jw=="
+                    .into(),
+            ),
+        )
+        .expect("build client");
+        let runtime = crate::runtime::Runtime::new_multi_thread().expect("runtime");
+        let cache = SchemaCache::default();
+        let schema: Arc<Schema> =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
+        cache
+            .lock()
+            .unwrap()
+            .insert(("db".to_string(), "items".to_string()), schema.clone());
+
+        let got = sample_schema(&client, &runtime, &cache, "db", "items")
+            .expect("cache hit should not sample");
+        assert_eq!(got.fields().len(), 1);
+        assert_eq!(got.field(0).name(), "id");
+    }
 }

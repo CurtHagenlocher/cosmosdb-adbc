@@ -396,8 +396,11 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
   `register_cosmos_schema` → provider, so inferred schemas are memoized for the connection's
   lifetime and reused across queries. Unit test (cache hit returns the memoized schema without
   networking — client points at an unreachable endpoint) + live test (two queries on one
-  connection: populate then reuse). Metadata (`get_table_schema`/`get_objects`) still re-samples —
-  a candidate to share this cache later.
+  connection: populate then reuse). **Metadata shares the same cache (2026-07-02):**
+  `get_table_schema` and `get_objects` (column depth) go through `sample_schema`, which checks the
+  cache before sampling — so a container's schema is inferred once per connection whether first
+  touched by a query or a metadata call (best-effort snapshot; whichever path samples first wins;
+  empty containers aren't cached). Unit test: `sample_schema` cache hit skips networking.
 - **Schema-inference knobs (§3.5) — first cut DONE, live-verified (2026-07-01).** `inference.rs`
   drives `struct`-mode inference from `InferenceOptions`: base arrow-json inference, then top-level
   type transforms — `number_inference=decimal` (fractional fields → `Decimal128(p,s)`; integers stay
