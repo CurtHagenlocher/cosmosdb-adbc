@@ -13,6 +13,7 @@ adbc_ffi = { workspace = true, optional = true }
 arrow-array.workspace = true
 arrow-schema.workspace = true
 arrow-json = "58"
+regex = "1"
 driverbase.workspace = true
 cosmos-client = { path = "../cosmos-client" }
 cosmos-datafusion = { path = "../cosmos-datafusion" }

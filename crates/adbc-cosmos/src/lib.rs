@@ -15,6 +15,7 @@ mod connection;
 mod database;
 mod driver;
 mod error;
+mod metadata;
 mod options;
 mod output;
 mod runtime;

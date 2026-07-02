@@ -52,17 +52,30 @@ pub fn build_json_batch(docs: &[Value]) -> Result<RecordBatch> {
 /// Fields absent from a given document become null; fields that appear only *after* the
 /// sample are dropped (the documented cost of sampling — default to JSON for fully
 /// heterogeneous data).
+/// Infer an Arrow `Struct` schema from the first `sample_size` documents. Shared by the
+/// `struct` output builder and the connection metadata surface (`get_objects` columns,
+/// `get_table_schema`). Empty input yields an empty schema. Returns the raw `ArrowError` so
+/// callers can map it into whichever error flavor they need (`driverbase` vs ADBC).
+pub fn infer_struct_schema(
+    docs: &[Value],
+    sample_size: usize,
+) -> std::result::Result<Arc<Schema>, ArrowError> {
+    if docs.is_empty() {
+        return Ok(Arc::new(Schema::empty()));
+    }
+    let sample_n = sample_size.max(1);
+    let schema =
+        infer_json_schema_from_iterator(docs.iter().take(sample_n).map(Ok::<_, ArrowError>))?;
+    Ok(Arc::new(schema))
+}
+
 pub fn build_struct_batch(docs: &[Value], sample_size: usize) -> Result<RecordBatch> {
     if docs.is_empty() {
         return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
     }
 
-    let sample_n = sample_size.max(1);
-    let schema = infer_json_schema_from_iterator(
-        docs.iter().take(sample_n).map(Ok::<_, ArrowError>),
-    )
-    .map_err(|e| arrow_err("infer_json_schema", e))?;
-    let schema = Arc::new(schema);
+    let schema =
+        infer_struct_schema(docs, sample_size).map_err(|e| arrow_err("infer_json_schema", e))?;
 
     let mut decoder = ReaderBuilder::new(schema.clone())
         .build_decoder()

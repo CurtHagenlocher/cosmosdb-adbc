@@ -56,6 +56,27 @@ impl CosmosClientHandle {
         Ok(Self { client })
     }
 
+    /// List the databases in the account (ADBC catalogs).
+    pub async fn list_databases(&self) -> azure_core::Result<Vec<String>> {
+        let dbs: Vec<azure_data_cosmos::models::DatabaseProperties> = self
+            .client
+            .query_databases("SELECT * FROM root", None)?
+            .try_collect()
+            .await?;
+        Ok(dbs.into_iter().map(|d| d.id).collect())
+    }
+
+    /// List the containers in a database (ADBC tables).
+    pub async fn list_containers(&self, database: &str) -> azure_core::Result<Vec<String>> {
+        let colls: Vec<azure_data_cosmos::models::ContainerProperties> = self
+            .client
+            .database_client(database)
+            .query_containers("SELECT * FROM root", None)?
+            .try_collect()
+            .await?;
+        Ok(colls.into_iter().map(|c| c.id.into_owned()).collect())
+    }
+
     /// Run a Cosmos SQL query across all partitions via the experimental engine, returning
     /// every matching document as a raw JSON value.
     ///

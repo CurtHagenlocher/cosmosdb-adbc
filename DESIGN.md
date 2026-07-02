@@ -384,6 +384,14 @@ Cloned to `reference/`: `azure-cosmos-client-engine` (v0.5.0), `adbc-datafusion`
 
 ## 8. Build status
 
+- **Connection metadata — DONE, live-verified (2026-07-01).** `metadata.rs`: `get_objects`
+  (via `driverbase::get_objects` — catalog = Cosmos database, single empty schema, table =
+  container, columns inferred by sampling per §3.5), `get_table_schema` (samples + infers a
+  container's Arrow schema), and `get_table_types` (`["table"]`). `cosmos-client` gained
+  `list_databases`/`list_containers` (SDK `query_databases`/`query_containers`). ADBC LIKE
+  search patterns supported on catalog/table/column filters. Verified in-process
+  (`tests/live_driver.rs`) and across the C ABI (`validation/roundtrip.py` now 15/15, navigating
+  `get_objects` catalog→schema→table→columns).
 - **Python/ADBC cdylib round-trip — DONE, live-verified (2026-07-01).** `validation/roundtrip.py`
   loads the built `adbc_cosmos.dll` through `adbc_driver_manager` (entrypoint
   `AdbcDriverCosmosDbInit`) exactly as a real Python/pyarrow consumer would, proving the whole C

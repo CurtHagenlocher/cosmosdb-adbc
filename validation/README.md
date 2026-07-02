@@ -14,6 +14,9 @@ Loads `target/debug/adbc_cosmos.dll` via `adbc_driver_manager` and asserts:
 - **native dialect / struct** — schema inference yields real `id`/`pk`/`mergeOrder`/… columns.
 - **datafusion dialect** — cross-container `JOIN` (Cosmos can't do this; DataFusion does), 50 rows.
 - **datafusion dialect** — filter pushdown (`WHERE "mergeOrder" > 25`) returns the 25-row subset.
+- **connection metadata** — `get_table_types` (`["table"]`), `get_table_schema` (inferred `items`
+  columns), and `get_objects` navigated catalog→schema→table→columns (lists the `spikedb` catalog,
+  `items`+`categories` containers, and `items` columns).
 
 ### Prerequisites
 
@@ -32,5 +35,5 @@ emulator endpoint + key (not secrets).
 python validation/roundtrip.py
 ```
 
-Exit code is non-zero if any check fails. Verified 2026-07-01: 10/10 pass
+Exit code is non-zero if any check fails. Verified 2026-07-01: 15/15 pass
 (pyarrow 24.0.0, adbc-driver-manager 1.11.0, Python 3.11).

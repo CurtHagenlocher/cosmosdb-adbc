@@ -21,7 +21,12 @@ import sys
 from pathlib import Path
 
 import pyarrow
-from adbc_driver_manager import AdbcConnection, AdbcDatabase, AdbcStatement
+from adbc_driver_manager import (
+    AdbcConnection,
+    AdbcDatabase,
+    AdbcStatement,
+    GetObjectsDepth,
+)
 
 # Public, well-known emulator key (not a secret).
 EMULATOR_KEY = (
@@ -41,9 +46,8 @@ def find_driver() -> str:
     sys.exit(f"driver cdylib not found under {root}/target — run `cargo build -p adbc-cosmos`")
 
 
-def run_query(driver: str, stmt_opts: dict[str, str], sql: str) -> pyarrow.Table:
-    """Load the driver, run one query, return the result as a pyarrow Table."""
-    db = AdbcDatabase(
+def open_database(driver: str) -> AdbcDatabase:
+    return AdbcDatabase(
         driver=driver,
         entrypoint=ENTRYPOINT,
         **{
@@ -53,6 +57,11 @@ def run_query(driver: str, stmt_opts: dict[str, str], sql: str) -> pyarrow.Table
             "adbc.cosmos.database": DATABASE,
         },
     )
+
+
+def run_query(driver: str, stmt_opts: dict[str, str], sql: str) -> pyarrow.Table:
+    """Load the driver, run one query, return the result as a pyarrow Table."""
+    db = open_database(driver)
     try:
         conn = AdbcConnection(db)
         try:
@@ -158,6 +167,51 @@ def test_datafusion_filter_pushdown(driver: str) -> None:
     check("every row satisfies mergeOrder > 25", all_gt, "a row leaked past the filter")
 
 
+def test_metadata(driver: str) -> None:
+    print("[connection metadata] get_table_types / get_table_schema / get_objects")
+    db = open_database(driver)
+    try:
+        conn = AdbcConnection(db)
+        try:
+            # get_table_types  (keep each C handle alive in a local until imported)
+            tt_h = conn.get_table_types()
+            tt = pyarrow.RecordBatchReader._import_from_c(tt_h.address).read_all()
+            check("get_table_types == ['table']",
+                  tt.column("table_type").to_pylist() == ["table"],
+                  str(tt.to_pylist()))
+
+            # get_table_schema (catalog defaults to current database)
+            sch_h = conn.get_table_schema(None, None, "items")
+            schema = pyarrow.Schema._import_from_c(sch_h.address)
+            check("get_table_schema infers items columns",
+                  {"id", "pk", "mergeOrder"}.issubset(set(schema.names)),
+                  str(schema.names))
+
+            # get_objects (ALL depth) → navigate catalog → schema → table → columns
+            obj_h = conn.get_objects(GetObjectsDepth.ALL, None, None, None, None, None)
+            objs = pyarrow.RecordBatchReader._import_from_c(obj_h.address).read_all()
+            rows = objs.to_pylist()
+            cat = next((r for r in rows if r["catalog_name"] == DATABASE), None)
+            check("get_objects lists the database as a catalog", cat is not None,
+                  str([r["catalog_name"] for r in rows]))
+            tables = [
+                t
+                for s in (cat["catalog_db_schemas"] or [])
+                for t in (s["db_schema_tables"] or [])
+            ]
+            tnames = {t["table_name"] for t in tables}
+            check("get_objects lists items+categories containers",
+                  {"items", "categories"}.issubset(tnames), str(sorted(tnames)))
+            items = next((t for t in tables if t["table_name"] == "items"), None)
+            cols = {c["column_name"] for c in (items["table_columns"] or [])} if items else set()
+            check("get_objects lists items columns (id/pk/mergeOrder)",
+                  {"id", "pk", "mergeOrder"}.issubset(cols), str(sorted(cols)))
+        finally:
+            conn.close()
+    finally:
+        db.close()
+
+
 def main() -> int:
     driver = find_driver()
     print(f"driver: {driver}\nentrypoint: {ENTRYPOINT}\n")
@@ -166,6 +220,7 @@ def main() -> int:
         test_native_struct,
         test_datafusion_join,
         test_datafusion_filter_pushdown,
+        test_metadata,
     ):
         try:
             test(driver)

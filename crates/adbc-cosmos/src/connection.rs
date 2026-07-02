@@ -71,33 +71,42 @@ impl Connection for CosmosConnection {
 
     fn get_objects(
         &self,
-        _depth: ObjectDepth,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: Option<&str>,
-        _table_type: Option<Vec<&str>>,
-        _column_name: Option<&str>,
+        depth: ObjectDepth,
+        catalog: Option<&str>,
+        db_schema: Option<&str>,
+        table_name: Option<&str>,
+        table_type: Option<Vec<&str>>,
+        column_name: Option<&str>,
     ) -> Result<Box<dyn RecordBatchReader + Send>> {
-        Err(ErrorHelper::not_implemented()
-            .message("get_objects")
-            .to_adbc())
+        let inner = crate::metadata::CosmosGetObjects::new(self.client.clone(), self.runtime.clone());
+        Ok(driverbase::get_objects::get_objects(
+            inner, depth, catalog, db_schema, table_name, table_type, column_name,
+        ))
     }
 
     fn get_table_schema(
         &self,
-        _catalog: Option<&str>,
+        catalog: Option<&str>,
         _db_schema: Option<&str>,
-        _table_name: &str,
+        table_name: &str,
     ) -> Result<Schema> {
-        Err(ErrorHelper::not_implemented()
-            .message("get_table_schema")
-            .to_adbc())
+        // catalog = Cosmos database; fall back to the connection's current database.
+        let database = catalog
+            .map(str::to_string)
+            .or_else(|| self.current_database.clone())
+            .ok_or_else(|| {
+                ErrorHelper::invalid_argument()
+                    .message("get_table_schema requires a catalog (database) or a current database")
+                    .to_adbc()
+            })?;
+        let schema =
+            crate::metadata::sample_schema(&self.client, &self.runtime, &database, table_name)
+                .map_err(|e| e.to_adbc())?;
+        Ok(schema.as_ref().clone())
     }
 
     fn get_table_types(&self) -> Result<Box<dyn RecordBatchReader + Send>> {
-        Err(ErrorHelper::not_implemented()
-            .message("get_table_types")
-            .to_adbc())
+        Ok(crate::metadata::table_types_reader())
     }
 
     fn get_statistic_names(&self) -> Result<Box<dyn RecordBatchReader + Send>> {

@@ -16,6 +16,7 @@ dependencies = [
  "datafusion",
  "driverbase",
  "parquet-variant-compute",
+ "regex",
  "serde_json",
  "tokio",
 ]
