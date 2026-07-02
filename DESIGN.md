@@ -167,7 +167,8 @@ Three crates, layered so DataFusion/Arrow/ADBC types never leak into transport (
 - **Schema/output builders (`schema.rs`)**: sample N docs → `infer_json_schema_from_iterator`;
   build `RecordBatch` in JSON (`arrow.json` field metadata), Variant (`json_to_variant`, feature
   `variant`), or inferred-struct (`ReaderBuilder`/`Decoder`) form. Missing fields → null;
-  out-of-sample / conflicting fields → fall back to JSON column for that field or the whole doc.
+  type-mapping and the conflicting/heterogeneous-field policy (default: fall back to `Variant`, not
+  `String`) are specified in **§3.5**.
 - **`catalog.rs`**: Cosmos database→ADBC catalog, container→table (schema `"public"`), registered
   as lazy providers so listing is cheap and inference happens on first schema access.
 
@@ -196,7 +197,64 @@ Three crates, layered so DataFusion/Arrow/ADBC types never leak into transport (
 | `adbc.cosmos.container` | Statement | container name | target for `native` dialect |
 | `adbc.cosmos.output` | Statement | `json` (default) \| `variant` \| `struct` | result representation |
 | `adbc.cosmos.sample_size` | Statement/Connection | int (e.g. 1000) | docs to sample for `struct` inference |
+| `adbc.cosmos.number_inference` | Statement | `float64` (default) \| `decimal` | numeric fidelity (see §3.5) — applied uniformly |
+| `adbc.cosmos.decimal` | Statement | `p,s` (e.g. `38,9`) | precision,scale when `number_inference=decimal` |
+| `adbc.cosmos.heterogeneous` | Statement | `variant` (default) \| `string` | fallback for type-conflicting fields (`struct` output) |
+| `adbc.cosmos.infer_temporal` | Statement | `off` (default) \| `on` | infer `Date`/`Timestamp` from ISO-8601 strings (`struct`) |
+| `adbc.cosmos.epoch_fields` | Statement | comma list | fields to read as epoch timestamps; `name:s`/`name:ms` |
 | `adbc.cosmos.max_retries` | Connection | int | 429 throttling retries |
+
+### 3.5 Schema inference & type mapping
+
+Inference only matters for the `struct` and (to a lesser degree) `variant` outputs; the default
+`json` output is a lossless passthrough that needs none. Two layers:
+
+- **Layer 1 — value → type.** Given sampled JSON values for a field, pick an Arrow type.
+- **Layer 2 — representation.** Choose how to *carry* a field: a typed Arrow type, a `Variant`,
+  or a JSON-string fallback. This is a lever the ODBC driver lacks (it has only a flat SQL type
+  system), and it's where Arrow lets us beat it.
+
+**Guiding principle: conservative, lossy-safe defaults; richer targets are opt-in.** This mirrors
+the Microsoft ODBC driver (our analog), whose inference we measured live (see
+`journal/research/cosmosdb/odbc_driver.md`): it infers `Int64` for integral numbers (big ints kept
+exact), `Double` for any-fractional, `Boolean`, and otherwise `String` — and deliberately does
+**not** guess dates, timestamps, decimals, or GUIDs, and widens type-conflicting fields to
+`String`. It also *flattens* nested objects and normalizes arrays into child tables (both artifacts
+of a flat type system we don't share).
+
+**Base inference (`struct`):** arrow-json `infer_json_schema_from_iterator` over the sample →
+`Int64` / `Float64` / `Boolean` / `Utf8` / **`Struct`** / **`List`** (real nesting, not the ODBC
+flatten) / null-for-missing, everything nullable. This already matches the ODBC driver on scalars
+and beats it on structure.
+
+**Confirmed policy decisions (2026-07-01):**
+
+1. **Numbers — one "numeric fidelity" knob, applied uniformly (`number_inference`).** Default
+   `float64`: typed columns → `Float64`, variant numbers → `Double`. Opt-in `decimal` (with
+   `decimal = p,s`): typed columns → `Decimal128(p,s)`. The knob governs *both* representations so
+   we never ship a surprising typed-vs-variant asymmetry. Integers are always exact `Int64` (both
+   representations agree). **Empirical caveat (verified against `parquet-variant-compute` 58.3):
+   `json_to_variant` currently encodes *all* fractionals — and integers beyond `i64` — as `Double`;
+   it does not yet emit Variant decimals** (upstream `// Todo`). So under `number_inference=decimal`
+   the decimal typing applies to `struct` columns today; `variant` numbers stay `Double` until the
+   library supports decimal encoding (a library limitation we document, not a designed asymmetry —
+   revisit when upstream lands it, or hand-roll only if a user needs it sooner).
+2. **Heterogeneous / type-conflicting fields (`heterogeneous`).** Default `variant` (self-describing,
+   lossless) rather than the ODBC driver's widen-to-`String`; opt-in `string` for maximum
+   consumer compatibility. (JSON-string fallback for the whole doc remains the ultimate backstop.)
+3. **Dates/datetimes from strings (`infer_temporal`, default `off`).** ISO-8601 string → `Date32`/
+   `Timestamp` is pattern-guessing and can misfire on a field that merely looks date-like; the ODBC
+   driver doesn't do it, so we default off and make it explicit opt-in.
+4. **Epoch numbers → timestamps (`epoch_fields`).** A bare number can't be distinguished from an ID
+   or count, so Unix-timestamp inference is **never** automatic — the user names the fields and unit
+   (`_ts:s`, `createdAt:ms`).
+5. **Nested objects/arrays → `Struct`/`List`** by default (lossless), with `Variant` or JSON-string
+   as per-field fallbacks under heterogeneity or low sample confidence.
+
+**Known precision limitation (track):** integers larger than `i64` (Cosmos can produce them) lose
+precision — `Double` in `variant` today, and `arrow-json` would infer/overflow `Int64` in `struct`.
+Rare, but a real edge (`_ts`/epoch/large IDs need care; ties into §4 numeric policy). Candidate
+fix: promote out-of-`i64` integers to `Decimal128`/`Decimal256`.
 
 ---
 
