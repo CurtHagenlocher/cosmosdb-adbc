@@ -6,3 +6,7 @@
 .env
 *.pem
 local.settings.json
+
+# Python
+__pycache__/
+*.pyc
