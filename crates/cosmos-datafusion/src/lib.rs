@@ -12,6 +12,7 @@ mod convert;
 pub mod normalize;
 mod predicate;
 mod provider;
+mod pushdown;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,7 @@ use datafusion::prelude::SessionContext;
 
 pub use catalog::CosmosSchemaProvider;
 pub use provider::CosmosTableProvider;
+pub use pushdown::PushdownConfig;
 
 /// A container's inferred Arrow schema, cached by `(database, container)`. Inference samples
 /// documents, so this avoids re-sampling the same container across queries on a connection.
@@ -45,4 +47,11 @@ pub fn register_cosmos_schema(
         .ok_or_else(|| DataFusionError::Plan("default catalog 'datafusion' not found".into()))?;
     catalog.register_schema("public", provider)?;
     Ok(())
+}
+
+/// Install the Cosmos aggregate-pushdown optimizer rule on `ctx`, folding a whole-container
+/// `COUNT(*)` / `AVG(col)` into one `SELECT VALUE …` round-trip per [`PushdownConfig`]. Call
+/// once per context before planning; unaffected queries plan exactly as before.
+pub fn install_pushdown(ctx: &SessionContext, config: PushdownConfig) {
+    ctx.add_optimizer_rule(Arc::new(pushdown::AggregatePushdown::new(config)));
 }

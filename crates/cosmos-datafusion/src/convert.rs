@@ -3,9 +3,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow_json::reader::{ReaderBuilder, infer_json_schema_from_iterator};
-use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use serde_json::Value;
 
 use crate::normalize;
@@ -34,6 +34,34 @@ pub(crate) fn decode_docs(schema: SchemaRef, docs: &[Value]) -> Result<Vec<Recor
     let mut decoder = ReaderBuilder::new(schema).build_decoder()?;
     decoder.serialize(&normalized)?;
     Ok(decoder.flush()?.into_iter().collect())
+}
+
+/// Decode a `SELECT VALUE <aggregate>` response into a single-row batch matching `schema`.
+///
+/// The response is at most one bare scalar (Cosmos returns `[n]` for `COUNT`, `[avg]` for
+/// `AVG`, or `[]` when the aggregate is undefined — e.g. `AVG` over no numeric values).
+/// `schema` has exactly one field whose type was copied from the DataFusion aggregate output,
+/// so the fold reproduces that node's schema exactly:
+/// - `Int64` (COUNT): missing → `0`, matching COUNT over an empty set.
+/// - `Float64` (AVG): missing → `null`, matching AVG over an empty set.
+pub(crate) fn decode_scalar_agg(
+    schema: SchemaRef,
+    docs: &[Value],
+) -> Result<Vec<RecordBatch>, ArrowError> {
+    let value = docs.first();
+    let field = schema.field(0);
+    let array: ArrayRef = match field.data_type() {
+        DataType::Int64 => {
+            Arc::new(Int64Array::from(vec![value.and_then(Value::as_i64).unwrap_or(0)]))
+        }
+        DataType::Float64 => Arc::new(Float64Array::from(vec![value.and_then(Value::as_f64)])),
+        other => {
+            return Err(ArrowError::SchemaError(format!(
+                "unsupported aggregate output type {other:?}"
+            )));
+        }
+    };
+    Ok(vec![RecordBatch::try_new(schema, vec![array])?])
 }
 
 /// Build the projected output schema and the Cosmos SQL for a scan.

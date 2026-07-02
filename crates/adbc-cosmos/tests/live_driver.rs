@@ -206,6 +206,63 @@ fn datafusion_dialect_pushes_filter_into_cosmos() {
     }
 }
 
+#[test]
+#[ignore = "requires the local Cosmos emulator (run cosmos-client's seed example first)"]
+fn datafusion_dialect_folds_count_and_avg() {
+    use arrow_array::{Float64Array, Int64Array};
+
+    // `mergeOrder` is 1..=50 across the 50 seeded items, so COUNT(*) = 50, COUNT(*) with the
+    // `> 25` filter = 25, and AVG(mergeOrder) = (1+…+50)/50 = 25.5. Each folds to a single
+    // `SELECT VALUE …` round-trip (see cosmos-datafusion::pushdown).
+    fn scalar_i64<C: Connection>(conn: &mut C, sql: &str) -> i64 {
+        let mut stmt = conn.new_statement().expect("new_statement");
+        stmt.set_option(
+            OptionStatement::Other("adbc.cosmos.dialect".into()),
+            OptionValue::String("datafusion".into()),
+        )
+        .expect("set dialect");
+        stmt.set_sql_query(sql).expect("set query");
+        let batches: Vec<_> = stmt.execute().expect("execute").map(|b| b.expect("batch")).collect();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "a bare aggregate returns exactly one row");
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 count")
+            .value(0)
+    }
+
+    let mut conn = open_connection();
+    assert_eq!(scalar_i64(&mut conn, "SELECT COUNT(*) FROM items"), 50);
+    assert_eq!(
+        scalar_i64(&mut conn, r#"SELECT COUNT(*) FROM items WHERE "mergeOrder" > 25"#),
+        25,
+    );
+
+    // AVG is opt-in: enable the toggle, then confirm the folded average.
+    let mut stmt = conn.new_statement().expect("new_statement");
+    stmt.set_option(
+        OptionStatement::Other("adbc.cosmos.dialect".into()),
+        OptionValue::String("datafusion".into()),
+    )
+    .expect("set dialect");
+    stmt.set_option(
+        OptionStatement::Other("adbc.cosmos.pushdown.avg".into()),
+        OptionValue::String("on".into()),
+    )
+    .expect("set pushdown.avg=on");
+    stmt.set_sql_query(r#"SELECT AVG("mergeOrder") FROM items"#).expect("set query");
+    let batches: Vec<_> = stmt.execute().expect("execute").map(|b| b.expect("batch")).collect();
+    let avg = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("Float64 avg")
+        .value(0);
+    assert!((avg - 25.5).abs() < 1e-9, "AVG(mergeOrder) should be 25.5, got {avg}");
+}
+
 /// Open a connection to the seeded emulator database.
 fn open_connection() -> impl Connection {
     let mut driver = CosmosDriver::default();

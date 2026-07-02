@@ -47,6 +47,11 @@ pub const HETEROGENEOUS: &str = "adbc.cosmos.heterogeneous";
 pub const INFER_TEMPORAL: &str = "adbc.cosmos.infer_temporal";
 /// Comma list of fields to read as epoch timestamps, each `name:s` or `name:ms`.
 pub const EPOCH_FIELDS: &str = "adbc.cosmos.epoch_fields";
+/// Fold `COUNT(*)` to `SELECT VALUE COUNT(1)` in the `datafusion` dialect: `on` (default) | `off`.
+pub const PUSHDOWN_COUNT: &str = "adbc.cosmos.pushdown.count";
+/// Fold `AVG(col)` to `SELECT VALUE AVG(col)` in the `datafusion` dialect: `off` (default) | `on`.
+/// Off by default — Cosmos aggregate null semantics may differ from ANSI SQL (see design §3.2).
+pub const PUSHDOWN_AVG: &str = "adbc.cosmos.pushdown.avg";
 
 /// Extract a string option value, or error if the caller passed a non-string.
 pub(crate) fn require_string(key: &str, value: OptionValue) -> Result<String> {

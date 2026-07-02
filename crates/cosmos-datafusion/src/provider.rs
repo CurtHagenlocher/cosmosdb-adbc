@@ -43,6 +43,12 @@ impl CosmosTableProvider {
             schema,
         }
     }
+
+    /// The transport handle and target `(database, container)` — used by the aggregate
+    /// pushdown rule to build a folded scan over the same container.
+    pub(crate) fn parts(&self) -> (Arc<CosmosClientHandle>, String, String) {
+        (self.client.clone(), self.database.clone(), self.container.clone())
+    }
 }
 
 impl fmt::Debug for CosmosTableProvider {
@@ -106,6 +112,15 @@ impl TableProvider for CosmosTableProvider {
     }
 }
 
+/// How [`CosmosExec`] turns the query response into Arrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodeMode {
+    /// The response is a stream of JSON documents, decoded into the scan schema.
+    Docs,
+    /// The response is a single `SELECT VALUE <agg>` scalar (aggregate pushdown).
+    ScalarAgg,
+}
+
 /// Physical scan of one Cosmos container: runs the generated Cosmos SQL through the engine
 /// and projects the resulting documents into the scan's Arrow schema. All I/O is deferred to
 /// stream-poll time so we never block inside DataFusion's async executor.
@@ -115,6 +130,7 @@ pub(crate) struct CosmosExec {
     container: String,
     sql: String,
     schema: SchemaRef,
+    decode: DecodeMode,
     properties: Arc<PlanProperties>,
 }
 
@@ -125,6 +141,28 @@ impl CosmosExec {
         container: String,
         sql: String,
         schema: SchemaRef,
+    ) -> Self {
+        Self::with_decode(client, database, container, sql, schema, DecodeMode::Docs)
+    }
+
+    /// A scan whose query is a single `SELECT VALUE <aggregate>` returning one scalar row.
+    pub(crate) fn new_scalar_agg(
+        client: Arc<CosmosClientHandle>,
+        database: String,
+        container: String,
+        sql: String,
+        schema: SchemaRef,
+    ) -> Self {
+        Self::with_decode(client, database, container, sql, schema, DecodeMode::ScalarAgg)
+    }
+
+    fn with_decode(
+        client: Arc<CosmosClientHandle>,
+        database: String,
+        container: String,
+        sql: String,
+        schema: SchemaRef,
+        decode: DecodeMode,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -138,6 +176,7 @@ impl CosmosExec {
             container,
             sql,
             schema,
+            decode,
             properties,
         }
     }
@@ -196,6 +235,7 @@ impl ExecutionPlan for CosmosExec {
         let container = self.container.clone();
         let sql = self.sql.clone();
         let schema = self.schema.clone();
+        let decode = self.decode;
         let out_schema = self.schema.clone();
 
         let stream = futures::stream::once(async move {
@@ -203,8 +243,11 @@ impl ExecutionPlan for CosmosExec {
                 .query_documents(&database, &container, &sql)
                 .await
                 .map_err(|e| external(format!("cosmos query failed: {e}")))?;
-            let batches = convert::decode_docs(schema, &docs)
-                .map_err(|e| external(format!("decode failed: {e}")))?;
+            let batches = match decode {
+                DecodeMode::Docs => convert::decode_docs(schema, &docs),
+                DecodeMode::ScalarAgg => convert::decode_scalar_agg(schema, &docs),
+            }
+            .map_err(|e| external(format!("decode failed: {e}")))?;
             Ok::<_, DataFusionError>(futures::stream::iter(batches.into_iter().map(Ok)))
         })
         .try_flatten();

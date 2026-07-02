@@ -62,6 +62,9 @@ pub struct CosmosStatement {
     infer_temporal: bool,
     epoch_fields: HashMap<String, TimeUnit>,
     heterogeneous: HeterogeneousMode,
+    // `datafusion`-dialect aggregate pushdown toggles (DESIGN §3.2); see `pushdown_config`.
+    pushdown_count: bool,
+    pushdown_avg: bool,
     /// Shared container-schema cache for the `datafusion` dialect (owned by the connection).
     schema_cache: Arc<cosmos_datafusion::SchemaCache>,
     query: Option<String>,
@@ -89,7 +92,17 @@ impl CosmosStatement {
             infer_temporal: false,
             epoch_fields: HashMap::new(),
             heterogeneous: HeterogeneousMode::default(),
+            pushdown_count: true,
+            pushdown_avg: false,
             query: None,
+        }
+    }
+
+    /// The `datafusion`-dialect aggregate pushdown configuration from the parsed toggles.
+    fn pushdown_config(&self) -> cosmos_datafusion::PushdownConfig {
+        cosmos_datafusion::PushdownConfig {
+            count: self.pushdown_count,
+            avg: self.pushdown_avg,
         }
     }
 
@@ -202,6 +215,11 @@ fn parse_bool_onoff(key: &str, value: &str) -> Result<bool> {
     }
 }
 
+/// Render a boolean toggle back as its canonical `on`/`off` string for `get_option`.
+fn onoff(value: bool) -> String {
+    if value { "on".to_string() } else { "off".to_string() }
+}
+
 /// Parse `name:s,other:ms` into field → epoch unit.
 fn parse_epoch_fields(value: &str) -> Result<HashMap<String, TimeUnit>> {
     let mut map = HashMap::new();
@@ -279,12 +297,14 @@ impl Statement for CosmosStatement {
                 let sample = self.sample_size.unwrap_or(1000).max(1) as usize;
                 let client = self.client.clone();
                 let cache = self.schema_cache.clone();
+                let pushdown = self.pushdown_config();
                 let sql = query.to_string();
 
                 let (schema, batches) = self.runtime.block_on(async move {
                     use datafusion::prelude::SessionContext;
 
                     let ctx = SessionContext::new();
+                    cosmos_datafusion::install_pushdown(&ctx, pushdown);
                     cosmos_datafusion::register_cosmos_schema(&ctx, client, database, sample, cache)
                         .map_err(|e| df_error("register schema", e))?;
                     let df = ctx.sql(&sql).await.map_err(|e| df_error("plan sql", e))?;
@@ -392,6 +412,18 @@ impl Optionable for CosmosStatement {
                         value,
                     )?)?;
                 }
+                options::PUSHDOWN_COUNT => {
+                    self.pushdown_count = parse_bool_onoff(
+                        options::PUSHDOWN_COUNT,
+                        &options::require_string(options::PUSHDOWN_COUNT, value)?,
+                    )?;
+                }
+                options::PUSHDOWN_AVG => {
+                    self.pushdown_avg = parse_bool_onoff(
+                        options::PUSHDOWN_AVG,
+                        &options::require_string(options::PUSHDOWN_AVG, value)?,
+                    )?;
+                }
                 _ => return Err(ErrorHelper::set_unknown_option(&key).to_adbc()),
             },
             _ => return Err(ErrorHelper::set_unknown_option(&key).to_adbc()),
@@ -415,6 +447,8 @@ impl Optionable for CosmosStatement {
                     .container
                     .clone()
                     .ok_or_else(|| ErrorHelper::get_unknown_option(&key).to_adbc()),
+                options::PUSHDOWN_COUNT => Ok(onoff(self.pushdown_count)),
+                options::PUSHDOWN_AVG => Ok(onoff(self.pushdown_avg)),
                 _ => Err(ErrorHelper::get_unknown_option(&key).to_adbc()),
             },
             _ => Err(ErrorHelper::get_unknown_option(&key).to_adbc()),

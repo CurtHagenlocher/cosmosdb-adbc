@@ -155,6 +155,20 @@ Three crates, layered so DataFusion/Arrow/ADBC types never leak into transport (
   >   aggregates / ORDER BY) stays in DataFusion — the correct, reference-validated path.
   > - **`AVG` pushdown is safe** where the engine accepts it: cross-partition `AVG` is computed
   >   count-weighted correctly (verified skewed partitions → true average, not average-of-averages).
+  >
+  > **Implemented** (`pushdown.rs`, `AggregatePushdown` optimizer rule). A bare single aggregate
+  > (no `GROUP BY`/`DISTINCT`) directly over a Cosmos `TableScan` (any pushed `WHERE`, no `LIMIT`)
+  > folds into one `SELECT VALUE …` round-trip; anything else stays local. Two toggles mirror the
+  > Microsoft ODBC driver's `EnablePassdownOfAvgAggrFunction` / `EnableSortPassdownForMultipleColumns`
+  > passdown flags:
+  > - `adbc.cosmos.pushdown.count` (default **on**): fold `COUNT(*)`/`COUNT(<lit>)` → `SELECT VALUE
+  >   COUNT(1)`. Provably row-equivalent. `COUNT(col)` is **never** folded (Cosmos counts JSON-null,
+  >   DataFusion skips it).
+  > - `adbc.cosmos.pushdown.avg` (default **off**): fold `AVG(col)` → `SELECT VALUE AVG(col)`. The
+  >   engine averages correctly cross-partition, but Cosmos null/non-numeric aggregate semantics are
+  >   not proven equivalent to ANSI `avg` (which ignores nulls), so this is opt-in. The ODBC driver
+  >   defaults its AVG flag on because it always has a correct local fallback; we would actually
+  >   push, so we default off, consistent with the conservative-pushdown contract.
   > - **Multi-column `ORDER BY` should stay local unless a composite index is known to exist** — real
   >   Cosmos requires a composite index on the sort tuple or the pushed query fails (the emulator is
   >   lenient and does not enforce this). This mirrors the Microsoft ODBC driver, whose
@@ -203,6 +217,8 @@ Three crates, layered so DataFusion/Arrow/ADBC types never leak into transport (
 | `adbc.cosmos.heterogeneous` | Statement | `string` (default) \| `variant` | representation for type-conflicting `struct` fields; `variant` needs the `variant` feature |
 | `adbc.cosmos.infer_temporal` | Statement | `off` (default) \| `on` | infer `Date`/`Timestamp` from ISO-8601 strings (`struct`) |
 | `adbc.cosmos.epoch_fields` | Statement | comma list | fields to read as epoch timestamps; `name:s`/`name:ms` |
+| `adbc.cosmos.pushdown.count` | Statement | `on` (default) \| `off` | `datafusion` dialect: fold whole-container `COUNT(*)` → `SELECT VALUE COUNT(1)` (§3.2) |
+| `adbc.cosmos.pushdown.avg` | Statement | `off` (default) \| `on` | `datafusion` dialect: fold `AVG(col)` → `SELECT VALUE AVG(col)`; opt-in (null-semantics caveat, §3.2) |
 | `adbc.cosmos.max_retries` | Connection | int | 429 throttling retries |
 
 ### 3.5 Schema inference & type mapping
