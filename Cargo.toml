@@ -17,3 +17,13 @@ arrow-array = "58"
 arrow-schema = "58"
 # driverbase is git-only (not published); pin to the rev the DataFusion driver resolves to.
 driverbase = { git = "https://github.com/adbc-drivers/driverbase-rs.git", rev = "483f28e8720d1d41ca3e65c0d4a8569f47a17bdb" }
+
+# Size-optimized release: the cdylib statically links DataFusion + Arrow (a large tree), so
+# cross-crate dead-code elimination is the main lever. panic = "abort" is also correct for a
+# C-ABI cdylib (unwinding must not cross the FFI boundary) and drops the x64 unwind tables.
+# Cargo forces panic = "unwind" for test/bench builds, so `cargo test` is unaffected.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
